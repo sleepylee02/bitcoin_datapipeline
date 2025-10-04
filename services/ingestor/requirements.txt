@@ -1,0 +1,36 @@
+# Python Dependencies for Ingestor Service
+
+# TODO: Add WebSocket client
+# websockets==12.0
+
+# TODO: Add async HTTP client for REST API
+# aiohttp==3.9.1
+
+# TODO: Add AWS SDK for Kinesis
+# boto3==1.34.0
+# aioboto3==12.3.0  # Async boto3
+
+# TODO: Add Avro serialization
+# avro-python3==1.10.2
+# fastavro==1.9.0  # Faster Avro implementation
+
+# TODO: Add config management
+# pyyaml==6.0.1
+# pydantic==2.5.0  # For config validation
+# python-dotenv==1.0.0
+
+# TODO: Add health check server
+# fastapi==0.109.0
+# uvicorn==0.27.0
+
+# TODO: Add metrics
+# prometheus-client==0.19.0
+
+# TODO: Add logging
+# structlog==24.1.0
+
+# TODO: Add testing dependencies (separate requirements-dev.txt)
+# pytest==7.4.3
+# pytest-asyncio==0.23.3
+# pytest-mock==3.12.0
+# pytest-cov==4.1.0

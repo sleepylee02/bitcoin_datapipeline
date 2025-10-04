@@ -1,0 +1,46 @@
+# Local Development Configuration
+
+# TODO: Binance configuration
+# binance:
+#   websocket_url: "wss://stream.binance.com:9443/ws/"
+#   rest_api_url: "https://api.binance.com"
+#   symbols: ["BTCUSDT", "ETHUSDT"]  # Start with 2 symbols for testing
+#   streams:
+#     - trade  # Individual trades
+#     - depth  # Order book updates
+#     - kline_1m  # 1-minute candlesticks
+
+# TODO: Kinesis configuration (LocalStack)
+# kinesis:
+#   stream_name: "bitcoin-market-data"
+#   region: "us-east-1"
+#   endpoint_url: "http://localhost:4566"  # LocalStack endpoint
+#   batch_size: 500
+#   flush_interval_seconds: 1
+
+# TODO: Schema configuration
+# schema:
+#   avro_schema_path: "../../schemas/avro/market_data.avsc"
+
+# TODO: Health check configuration
+# health:
+#   port: 8080
+#   host: "0.0.0.0"
+
+# TODO: Heartbeat configuration
+# heartbeat:
+#   interval_seconds: 30
+#   stream_name: "ingestor-heartbeat"
+
+# TODO: Logging configuration
+# logging:
+#   level: "DEBUG"
+#   format: "json"
+#   output: "stdout"
+
+# TODO: Retry configuration
+# retry:
+#   max_attempts: 5
+#   initial_backoff_seconds: 1
+#   max_backoff_seconds: 60
+#   backoff_multiplier: 2
