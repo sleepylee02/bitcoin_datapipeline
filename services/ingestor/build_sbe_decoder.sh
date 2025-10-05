@@ -72,7 +72,6 @@ print(f'📋 Supported templates:')
 print(f'   - Trade Stream: {sbe_decoder_cpp.TRADES_STREAM_EVENT}')
 print(f'   - Best Bid/Ask: {sbe_decoder_cpp.BEST_BID_ASK_STREAM_EVENT}')
 print(f'   - Depth Diff: {sbe_decoder_cpp.DEPTH_DIFF_STREAM_EVENT}')
-print(f'   - Depth Snapshot: {sbe_decoder_cpp.DEPTH_SNAPSHOT_STREAM_EVENT}')
 "; then
     echo ""
     echo "🎉 All tests passed! The SBE decoder is ready for production use."

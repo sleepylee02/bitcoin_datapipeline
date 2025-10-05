@@ -29,8 +29,7 @@ constexpr uint16_t CURRENT_SCHEMA_VERSION = 0;
 enum class StreamTemplateId : uint16_t {
     TRADES_STREAM_EVENT = 10000,           // <symbol>@trade
     BEST_BID_ASK_STREAM_EVENT = 10001,     // <symbol>@bestBidAsk 
-    DEPTH_DIFF_STREAM_EVENT = 10002,       // <symbol>@depth
-    DEPTH_SNAPSHOT_STREAM_EVENT = 10003    // <symbol>@depth20
+    DEPTH_DIFF_STREAM_EVENT = 10002        // <symbol>@depth
 };
 
 // SBE message header structure

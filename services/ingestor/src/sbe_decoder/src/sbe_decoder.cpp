@@ -43,8 +43,7 @@ struct MessageHeader {
 enum class TemplateIdV1 : uint16_t {
     TRADES_STREAM_EVENT = 10000,           // <symbol>@trade
     BEST_BID_ASK_STREAM_EVENT = 10001,     // <symbol>@bestBidAsk
-    DEPTH_DIFF_STREAM_EVENT = 10002,       // <symbol>@depth
-    DEPTH_SNAPSHOT_STREAM_EVENT = 10003    // <symbol>@depth20
+    DEPTH_DIFF_STREAM_EVENT = 10002        // <symbol>@depth
 };
 
 struct HeaderLocation {
@@ -64,15 +63,11 @@ static bool isDepthDiffTemplate(uint16_t templateId) {
     return templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT) || templateId == 103;
 }
 
-static bool isDepthSnapshotTemplate(uint16_t templateId) {
-    return templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_SNAPSHOT_STREAM_EVENT) || templateId == 104;
-}
 
 static bool isKnownTemplate(uint16_t templateId) {
     return isTradeTemplate(templateId) ||
            isBestBidAskTemplate(templateId) ||
-           isDepthDiffTemplate(templateId) ||
-           isDepthSnapshotTemplate(templateId);
+           isDepthDiffTemplate(templateId);
 }
 
 static std::optional<HeaderLocation> locateSbeHeader(const char* buffer, size_t size) {
@@ -367,9 +362,6 @@ public:
         if (isDepthDiffTemplate(templateId)) {
             return decodeDepthDiff(data);
         }
-        if (isDepthSnapshotTemplate(templateId)) {
-            throw std::runtime_error("Depth snapshot decoding not yet implemented");
-        }
 
         throw std::runtime_error("Unknown SBE message template ID: " + std::to_string(templateId));
     }
@@ -391,7 +383,6 @@ PYBIND11_MODULE(sbe_decoder_cpp, m) {
     m.attr("TRADES_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::TRADES_STREAM_EVENT);
     m.attr("BEST_BID_ASK_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::BEST_BID_ASK_STREAM_EVENT);
     m.attr("DEPTH_DIFF_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT);
-    m.attr("DEPTH_SNAPSHOT_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::DEPTH_SNAPSHOT_STREAM_EVENT);
     
     // Export schema constants
     m.attr("EXPECTED_SCHEMA_ID") = BINANCE_SBE_SCHEMA_ID;
