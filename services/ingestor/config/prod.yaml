@@ -1,44 +1,41 @@
-# Local Development Configuration
+# Production Environment Configuration
 
 # Service configuration
 service_name: "bitcoin-ingestor"
-environment: "local"
-mode: "sbe"  # Options: rest, sbe, both
+environment: "prod"
+mode: "sbe"  # Production uses SBE streaming only
 
 # Binance configuration
 binance:
   rest_base_url: "https://data-api.binance.vision"
-  sbe_ws_url: "wss://stream-sbe.binance.com/ws"  # SBE WebSocket streaming
+  sbe_ws_url: "wss://stream-sbe.binance.com/ws"
   symbols: ["BTCUSDT"]
   rate_limit_requests_per_minute: 1200
   request_timeout_seconds: 30
-  # SBE authentication (set via environment variables for security)
   api_key: ${BINANCE_API_KEY}
   sbe_schema_version: "1:0"
 
-# AWS configuration (LocalStack for local development)
+# AWS configuration
 aws:
   region: "us-east-1"
-  # AWS credentials (optional for LocalStack, use environment variables)
-  access_key_id: ${AWS_ACCESS_KEY_ID:-localstack}
-  secret_access_key: ${AWS_SECRET_ACCESS_KEY:-localstack}
+  # AWS credentials (use IAM roles in production, environment variables for local testing)
+  access_key_id: ${AWS_ACCESS_KEY_ID}
+  secret_access_key: ${AWS_SECRET_ACCESS_KEY}
   # Kinesis Data Streams
   kinesis_trade_stream: "market-sbe-trade"
   kinesis_bba_stream: "market-sbe-bestbidask"
   kinesis_depth_stream: "market-sbe-depth"
-  kinesis_batch_size: 100  # Smaller batches for local testing
-  kinesis_flush_interval_seconds: 2
+  kinesis_batch_size: 500
+  kinesis_flush_interval_seconds: 1
   # S3
   s3_bucket: "bitcoin-data-lake"
   s3_bronze_prefix: "bronze"
-  # LocalStack endpoint
-  localstack_endpoint: "http://localhost:4566"
 
 # Retry configuration
 retry:
-  max_attempts: 3
+  max_attempts: 5
   initial_backoff_seconds: 1.0
-  max_backoff_seconds: 30.0
+  max_backoff_seconds: 60.0
   backoff_multiplier: 2.0
   jitter: true
 
@@ -50,15 +47,15 @@ health:
 
 # Logging configuration
 logging:
-  level: "DEBUG"
-  format: "text"  # Use text format for local development
+  level: "INFO"
+  format: "json"
   output: "stdout"
 
 # Metrics configuration
 metrics:
-  enable_prometheus: true
+  enable_prometheus: false  # Use CloudWatch in production
   prometheus_port: 8081
-  enable_cloudwatch: false  # Disable CloudWatch for local dev
+  enable_cloudwatch: true
   metrics_namespace: "BitcoinPipeline/Ingestor"
 
 # Schema paths

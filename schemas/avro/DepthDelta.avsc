@@ -1,0 +1,50 @@
+{
+  "type": "record",
+  "name": "DepthDelta",
+  "namespace": "binance",
+  "doc": "Order book depth delta (top-N compressed)",
+  "fields": [
+    {
+      "name": "symbol",
+      "type": "string",
+      "doc": "Trading pair symbol (e.g., BTCUSDT)"
+    },
+    {
+      "name": "event_ts",
+      "type": "long",
+      "doc": "Exchange event time in milliseconds"
+    },
+    {
+      "name": "ingest_ts",
+      "type": "long",
+      "doc": "Local receive time in milliseconds"
+    },
+    {
+      "name": "bids",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": "string"
+        }
+      },
+      "doc": "Array of bid [price, quantity] pairs as strings"
+    },
+    {
+      "name": "asks",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "array",
+          "items": "string"
+        }
+      },
+      "doc": "Array of ask [price, quantity] pairs as strings"
+    },
+    {
+      "name": "source",
+      "type": "string",
+      "doc": "Data source: 'sbe' or 'rest'"
+    }
+  ]
+}

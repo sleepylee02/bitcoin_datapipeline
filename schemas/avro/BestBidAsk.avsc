@@ -1,0 +1,48 @@
+{
+  "type": "record",
+  "name": "BestBidAsk",
+  "namespace": "binance",
+  "doc": "Best bid/ask price and size update",
+  "fields": [
+    {
+      "name": "symbol",
+      "type": "string",
+      "doc": "Trading pair symbol (e.g., BTCUSDT)"
+    },
+    {
+      "name": "event_ts",
+      "type": "long",
+      "doc": "Exchange event time in milliseconds"
+    },
+    {
+      "name": "ingest_ts",
+      "type": "long",
+      "doc": "Local receive time in milliseconds"
+    },
+    {
+      "name": "bid_px",
+      "type": "double",
+      "doc": "Best bid price"
+    },
+    {
+      "name": "bid_sz",
+      "type": "double",
+      "doc": "Best bid size"
+    },
+    {
+      "name": "ask_px",
+      "type": "double",
+      "doc": "Best ask price"
+    },
+    {
+      "name": "ask_sz",
+      "type": "double",
+      "doc": "Best ask size"
+    },
+    {
+      "name": "source",
+      "type": "string",
+      "doc": "Data source: 'sbe' or 'rest'"
+    }
+  ]
+}

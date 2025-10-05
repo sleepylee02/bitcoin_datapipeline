@@ -5,6 +5,10 @@ __pycache__/
 
 # C extensions
 *.so
+*.o
+*.a
+*.dylib
+*.dll
 
 # Distribution / packaging
 .Python
@@ -389,6 +393,13 @@ secrets/
 *.pem
 *.crt
 
+# Environment files with secrets
+*.env
+!*.env.example
+.env.local
+.env.development
+.env.production
+
 # Apache Flink
 flink-*/
 checkpoints/
@@ -416,3 +427,15 @@ webserver_config.py
 logs/
 dags/__pycache__/
 plugins/__pycache__/
+
+# C++ and Python extension builds
+*.cpython-*.so
+*.cpython-*.pyd
+*.pyi
+build/
+dist/
+*.egg-info/
+
+# SBE decoder specific artifacts
+services/ingestor/src/sbe_decoder/sbe_decoder_cpp*.so
+services/ingestor/src/sbe_decoder/build/
