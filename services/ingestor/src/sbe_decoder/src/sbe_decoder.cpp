@@ -116,18 +116,19 @@ struct TradeStreamMessage {
 } __attribute__((packed));
 
 // Best bid/ask message structure (BestBidAskStreamEvent)
+// Note: This is our best guess at Binance SBE layout - might need adjustment
 struct BestBidAskMessage {
-    uint64_t eventTime;     // microseconds
-    int64_t bidPrice;       // mantissa
-    int8_t bidPriceExponent;
-    int64_t bidQuantity;    // mantissa
-    int8_t bidQuantityExponent;
-    int64_t askPrice;       // mantissa
-    int8_t askPriceExponent;
-    int64_t askQuantity;    // mantissa
-    int8_t askQuantityExponent;
-    char symbol[16];        // null-terminated string
-} __attribute__((packed));
+    uint64_t eventTime;     // microseconds (8 bytes)
+    int64_t bidPrice;       // mantissa (8 bytes)
+    int8_t bidPriceExponent; // (1 byte)
+    int64_t bidQuantity;    // mantissa (8 bytes)  
+    int8_t bidQuantityExponent; // (1 byte)
+    int64_t askPrice;       // mantissa (8 bytes)
+    int8_t askPriceExponent; // (1 byte)
+    int64_t askQuantity;    // mantissa (8 bytes)
+    int8_t askQuantityExponent; // (1 byte) 
+    char symbol[16];        // null-terminated string (16 bytes)
+} __attribute__((packed));  // Total: 60 bytes, but actual blockLength=50
 
 // Price level for depth streams
 struct PriceLevel {
@@ -203,12 +204,16 @@ public:
         }
 
         size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        if (payloadOffset + sizeof(TradeStreamMessage) > size) {
-            throw std::runtime_error("Invalid trade message size");
+        const size_t actualPayloadSize = header.blockLength;
+        
+        if (payloadOffset + actualPayloadSize > size) {
+            throw std::runtime_error("Invalid trade message size: expected " + 
+                                   std::to_string(actualPayloadSize) + " bytes, got " + 
+                                   std::to_string(size - payloadOffset) + " bytes");
         }
 
         TradeStreamMessage trade{};
-        std::memcpy(&trade, buffer + payloadOffset, sizeof(TradeStreamMessage));
+        std::memcpy(&trade, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(TradeStreamMessage)));
 
         py::dict result;
         result["symbol"] = extractSymbol(trade.symbol);
@@ -242,12 +247,16 @@ public:
         }
 
         size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        if (payloadOffset + sizeof(BestBidAskMessage) > size) {
-            throw std::runtime_error("Invalid best bid/ask message size");
+        const size_t actualPayloadSize = header.blockLength;
+        
+        if (payloadOffset + actualPayloadSize > size) {
+            throw std::runtime_error("Invalid best bid/ask message size: expected " + 
+                                   std::to_string(actualPayloadSize) + " bytes, got " + 
+                                   std::to_string(size - payloadOffset) + " bytes");
         }
 
         BestBidAskMessage ticker{};
-        std::memcpy(&ticker, buffer + payloadOffset, sizeof(BestBidAskMessage));
+        std::memcpy(&ticker, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(BestBidAskMessage)));
 
         py::dict result;
         result["symbol"] = extractSymbol(ticker.symbol);
@@ -279,12 +288,16 @@ public:
         }
 
         size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        if (payloadOffset + sizeof(DepthDiffMessage) > size) {
-            throw std::runtime_error("Invalid depth diff message size");
+        const size_t actualPayloadSize = header.blockLength;
+        
+        if (payloadOffset + actualPayloadSize > size) {
+            throw std::runtime_error("Invalid depth diff message size: expected " + 
+                                   std::to_string(actualPayloadSize) + " bytes, got " + 
+                                   std::to_string(size - payloadOffset) + " bytes");
         }
 
         DepthDiffMessage depth{};
-        std::memcpy(&depth, buffer + payloadOffset, sizeof(DepthDiffMessage));
+        std::memcpy(&depth, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(DepthDiffMessage)));
 
         py::dict result;
         result["symbol"] = extractSymbol(depth.symbol);

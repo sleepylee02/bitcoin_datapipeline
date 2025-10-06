@@ -337,7 +337,7 @@ class BinanceSBEClient:
         return normalized_levels
 
     def _format_numeric(self, value: Any) -> str:
-        """Format numeric values as compact strings for Avro payloads."""
+        """Format numeric values as decimal strings for Avro payloads."""
         if value is None:
             return "0"
 
@@ -345,7 +345,9 @@ class BinanceSBEClient:
             return "1" if value else "0"
 
         if isinstance(value, (int, float)):
-            return format(value, '.16g')
+            # Use fixed decimal format to avoid scientific notation
+            # 8 decimal places is sufficient for crypto prices and quantities
+            return f"{float(value):.8f}".rstrip('0').rstrip('.')
 
         return str(value)
 
