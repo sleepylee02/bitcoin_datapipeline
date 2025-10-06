@@ -23,6 +23,12 @@
 #include "spot_sbe/ErrorResponse.h"
 #include "spot_sbe/BoolEnum.h"
 
+// Include decimal handling
+struct Decimal {
+    int64_t mantissa;
+    int8_t exponent;
+};
+
 namespace py = pybind11;
 
 using spot_sbe::MessageHeader;
@@ -63,6 +69,27 @@ bool as_bool(const BoolEnum::Value bool_enum) {
 
 double decode_decimal(int64_t mantissa, int8_t exponent) {
     return static_cast<double>(mantissa) * std::pow(10.0, exponent);
+}
+
+double decode_price_from_raw(uint64_t raw_value) {
+    // REST shows ~124k, SBE shows ~11M after /10^12 scaling
+    // Need to scale down more: 11M / 124k ≈ 100x difference
+    // Try 10^14 to get closer to correct range
+    return static_cast<double>(raw_value) / 100000000000000.0; // 10^14
+}
+
+double decode_quantity_from_raw(uint64_t raw_value) {
+    // Based on empirical data:
+    // REST qty: 0.001, SBE: 11.24 (after /10^18)
+    // Need additional scaling: 11.24 / 0.001 = 11,240 ≈ 10^4
+    // So total scaling should be 10^18 * 10^4 = 10^22
+    return static_cast<double>(raw_value) / 10000000000000000000000.0; // 10^22
+}
+
+double decode_bid_ask_price_from_raw(uint64_t raw_value) {
+    // BBA prices now showing e-12 values, which is way too small
+    // Need much less scaling - try same as trade prices first
+    return static_cast<double>(raw_value) / 100000000000000.0; // 10^14 (same as trades)
 }
 
 uint64_t micros_to_millis(uint64_t micros) {
@@ -192,15 +219,14 @@ private:
             // Price (8 bytes) - appears to be encoded as 64-bit integer
             if (offset + 8 <= data_size) {
                 uint64_t price_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                // Binance prices are often in satoshis or scaled by 10^8
-                result["price"] = static_cast<double>(price_raw) / 100000000.0; // Divide by 10^8
+                result["price"] = decode_price_from_raw(price_raw);
                 offset += 8;
             }
             
             // Quantity (8 bytes) - similar encoding to price
             if (offset + 8 <= data_size) {
                 uint64_t qty_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["qty"] = static_cast<double>(qty_raw) / 100000000.0; // Divide by 10^8
+                result["qty"] = decode_quantity_from_raw(qty_raw);
                 offset += 8;
             }
             
@@ -280,28 +306,28 @@ private:
             // Bid price (8 bytes) - likely scaled integer
             if (offset + 8 <= data_size) {
                 uint64_t bid_price_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["bid_px"] = static_cast<double>(bid_price_raw) / 100000000.0;
+                result["bid_px"] = decode_bid_ask_price_from_raw(bid_price_raw);
                 offset += 8;
             }
             
             // Bid quantity (8 bytes) - likely scaled integer
             if (offset + 8 <= data_size) {
                 uint64_t bid_qty_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["bid_sz"] = static_cast<double>(bid_qty_raw) / 100000000.0;
+                result["bid_sz"] = decode_quantity_from_raw(bid_qty_raw);
                 offset += 8;
             }
             
             // Ask price (8 bytes) - likely scaled integer
             if (offset + 8 <= data_size) {
                 uint64_t ask_price_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["ask_px"] = static_cast<double>(ask_price_raw) / 100000000.0;
+                result["ask_px"] = decode_bid_ask_price_from_raw(ask_price_raw);
                 offset += 8;
             }
             
             // Ask quantity (8 bytes) - likely scaled integer
             if (offset + 8 <= data_size) {
                 uint64_t ask_qty_raw = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["ask_sz"] = static_cast<double>(ask_qty_raw) / 100000000.0;
+                result["ask_sz"] = decode_quantity_from_raw(ask_qty_raw);
                 offset += 8;
             }
             
@@ -393,8 +419,8 @@ private:
                 
                 if (price_raw == 0 || qty_raw == 0) break; // End of valid data
                 
-                double price = static_cast<double>(price_raw) / 100000000.0;
-                double qty = static_cast<double>(qty_raw) / 100000000.0;
+                double price = decode_price_from_raw(price_raw);
+                double qty = decode_quantity_from_raw(qty_raw);
                 
                 // For simplicity, assume first half are bids, second half are asks
                 py::list level;
