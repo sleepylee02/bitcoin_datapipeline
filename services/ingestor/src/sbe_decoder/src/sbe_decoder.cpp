@@ -1,407 +1,342 @@
 /*
- * High-performance C++ SBE decoder for Binance market data.
+ * Python bindings for official Binance SBE C++ decoder.
  * 
- * This decoder follows the official Binance SBE C++ sample app patterns
- * for parsing binary WebSocket stream messages.
+ * This decoder follows the exact patterns from the official Binance SBE C++ sample app
+ * with Python bindings for integration into the Bitcoin data pipeline.
  * 
  * Based on: https://github.com/binance/binance-sbe-cpp-sample-app
  */
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/numpy.h>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <optional>
-#include <cstring>
-#include <cstdint>
-#include <cmath>
-#include <chrono>
-#include <stdexcept>
+#include <span>
+#include <iostream>
+
+// Include official Binance SBE headers (exactly as in the official sample)
+#include "spot_sbe/MessageHeader.h"
+#include "spot_sbe/ErrorResponse.h"
+#include "spot_sbe/WebSocketResponse.h"
+#include "spot_sbe/BoolEnum.h"
+#include "spot_sbe/AccountResponse.h"
+#include "spot_sbe/ExchangeInfoResponse.h"
+#include "spot_sbe/NewOrderResultResponse.h"
+#include "spot_sbe/OrderResponse.h"
+
+// Include official utility headers
+#include "util.h"
+#include "error.h"
+#include "exchange_info.h"
+#include "account.h"
+#include "post_order.h"
+#include "get_order.h"
+#include "web_socket_metadata.h"
 
 namespace py = pybind11;
 
-// Allow build-time overrides (defaults match Binance schema 1:0)
-#ifndef BINANCE_SBE_SCHEMA_ID
-#define BINANCE_SBE_SCHEMA_ID 1
-#endif
+using spot_sbe::AccountResponse;
+using spot_sbe::BoolEnum;
+using spot_sbe::ErrorResponse;
+using spot_sbe::ExchangeInfoResponse;
+using spot_sbe::MessageHeader;
+using spot_sbe::NewOrderResultResponse;
+using spot_sbe::OrderResponse;
+using spot_sbe::WebSocketResponse;
 
-#ifndef BINANCE_SBE_SCHEMA_VERSION
-#define BINANCE_SBE_SCHEMA_VERSION 0
-#endif
-
-// SBE Message header structure (from Binance SBE specification)
-struct MessageHeader {
-    uint16_t blockLength;
-    uint16_t templateId;
-    uint16_t schemaId;
-    uint16_t version;
-} __attribute__((packed));
-
-// Template IDs observed for Binance SBE WebSocket streams (schema 1:0)
-enum class TemplateIdV1 : uint16_t {
-    TRADES_STREAM_EVENT = 10000,            // <symbol>@trade
-    BEST_BID_ASK_STREAM_EVENT = 10001,      // <symbol>@bestBidAsk
-    DEPTH_DIFF_STREAM_EVENT = 10002,        // <symbol>@depth
-    DEPTH_DIFF_STREAM_EVENT_V2 = 10003      // <symbol>@depth (newer schema variant)
-};
-
-struct HeaderLocation {
-    MessageHeader header;
-    size_t offset;
-};
-
-static bool isTradeTemplate(uint16_t templateId) {
-    return templateId == static_cast<uint16_t>(TemplateIdV1::TRADES_STREAM_EVENT) || templateId == 101;
+// Helper function to convert SBE BoolEnum to Python bool (from official sample)
+bool as_bool(const BoolEnum::Value bool_enum) {
+    switch (bool_enum) {
+        case BoolEnum::Value::False: 
+            return false;
+        case BoolEnum::Value::True: 
+            return true;
+        case BoolEnum::Value::NULL_VALUE:
+            return false;
+    }
+    return false;
 }
 
-static bool isBestBidAskTemplate(uint16_t templateId) {
-    return templateId == static_cast<uint16_t>(TemplateIdV1::BEST_BID_ASK_STREAM_EVENT) || templateId == 102;
+// Read payload from Python bytes (equivalent to read_payload from official sample)
+std::vector<char> read_payload_from_python(const py::bytes& data) {
+    const char* buffer = PyBytes_AsString(data.ptr());
+    size_t size = PyBytes_Size(data.ptr());
+    return std::vector<char>(buffer, buffer + size);
 }
 
-static bool isDepthDiffTemplate(uint16_t templateId) {
-    return templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT) ||
-           templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT_V2) ||
-           templateId == 103;
-}
-
-
-static bool isKnownTemplate(uint16_t templateId) {
-    return isTradeTemplate(templateId) ||
-           isBestBidAskTemplate(templateId) ||
-           isDepthDiffTemplate(templateId);
-}
-
-static std::optional<HeaderLocation> locateSbeHeader(const char* buffer, size_t size) {
-    if (!buffer || size < sizeof(MessageHeader)) {
-        return std::nullopt;
-    }
-
-    const size_t maxOffset = size - sizeof(MessageHeader);
-    for (size_t offset = 0; offset <= maxOffset; ++offset) {
-        MessageHeader candidate{};
-        std::memcpy(&candidate, buffer + offset, sizeof(MessageHeader));
-
-        // Only validate schema ID and version - accept any template ID for now
-        if (candidate.schemaId != BINANCE_SBE_SCHEMA_ID || candidate.version != BINANCE_SBE_SCHEMA_VERSION) {
-            continue;
-        }
-
-        // Remove strict template validation - accept any template ID
-        // This allows us to handle unknown template IDs gracefully
-        
-        size_t minimumSize = offset + sizeof(MessageHeader);
-        if (minimumSize > size) {
-            continue;
-        }
-
-        return HeaderLocation{candidate, offset};
-    }
-
-    return std::nullopt;
-}
-
-// Trade stream message structure (TradesStreamEvent)
-struct TradeStreamMessage {
-    uint64_t eventTime;     // microseconds
-    uint64_t tradeTime;     // microseconds
-    int64_t tradeId;
-    int64_t price;          // mantissa
-    int8_t priceExponent;
-    int64_t quantity;       // mantissa
-    int8_t quantityExponent;
-    uint8_t isBuyerMaker;
-    char symbol[16];        // null-terminated string
-} __attribute__((packed));
-
-// Best bid/ask message structure (BestBidAskStreamEvent)
-// Note: This is our best guess at Binance SBE layout - might need adjustment
-struct BestBidAskMessage {
-    uint64_t eventTime;     // microseconds (8 bytes)
-    int64_t bidPrice;       // mantissa (8 bytes)
-    int8_t bidPriceExponent; // (1 byte)
-    int64_t bidQuantity;    // mantissa (8 bytes)  
-    int8_t bidQuantityExponent; // (1 byte)
-    int64_t askPrice;       // mantissa (8 bytes)
-    int8_t askPriceExponent; // (1 byte)
-    int64_t askQuantity;    // mantissa (8 bytes)
-    int8_t askQuantityExponent; // (1 byte) 
-    char symbol[16];        // null-terminated string (16 bytes)
-} __attribute__((packed));  // Total: 60 bytes, but actual blockLength=50
-
-// Price level for depth streams
-struct PriceLevel {
-    int64_t price;          // mantissa
-    int8_t priceExponent;
-    int64_t quantity;       // mantissa
-    int8_t quantityExponent;
-} __attribute__((packed));
-
-// Depth diff message structure (DepthDiffStreamEvent)
-struct DepthDiffMessage {
-    uint64_t eventTime;     // microseconds
-    uint64_t firstUpdateId;
-    uint64_t finalUpdateId;
-    uint16_t bidCount;
-    uint16_t askCount;
-    char symbol[16];        // null-terminated string
-    // Followed by variable-length bid/ask arrays
-} __attribute__((packed));
-
-class SBEDecoder {
-private:
-    static constexpr uint16_t EXPECTED_SCHEMA_ID = BINANCE_SBE_SCHEMA_ID;
-    static constexpr uint16_t EXPECTED_SCHEMA_VERSION = BINANCE_SBE_SCHEMA_VERSION;
-    
-    // Convert mantissa/exponent to double (Binance decimal encoding)
-    double decodeDecimal(int64_t mantissa, int8_t exponent) {
-        return static_cast<double>(mantissa) * std::pow(10.0, exponent);
-    }
-    
-    static uint64_t microsToMillis(uint64_t value) {
-        return value / 1000ULL;
-    }
-
-    // Extract null-terminated symbol string
-    std::string extractSymbol(const char* symbolBuffer, size_t maxLength = 16) {
-        size_t length = 0;
-        while (length < maxLength && symbolBuffer[length] != '\0') {
-            length++;
-        }
-        return std::string(symbolBuffer, length);
-    }
-    
-    // Validate SBE message header (relaxed validation)
-    bool validateHeader(const MessageHeader& header) {
-        // Only validate schema ID and version, accept any template ID
-        return header.schemaId == EXPECTED_SCHEMA_ID && 
-               header.version == EXPECTED_SCHEMA_VERSION;
-    }
-    
-    // Get current timestamp in milliseconds
-    uint64_t getCurrentTimeMillis() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
-
+// Main SBE decoder class (Python wrapper for official decoder logic)
+class BinanceSBEDecoder {
 public:
-    SBEDecoder() = default;
+    BinanceSBEDecoder() = default;
     
-    // Decode trade stream message (TradesStreamEvent)
-    py::dict decodeTrade(const py::bytes& data) {
-        const char* buffer = PyBytes_AsString(data.ptr());
-        size_t size = PyBytes_Size(data.ptr());
-
-        auto headerInfo = locateSbeHeader(buffer, size);
-        if (!headerInfo.has_value()) {
-            throw std::runtime_error("SBE trade message header not found");
-        }
-
-        const MessageHeader& header = headerInfo->header;
-        if (!isTradeTemplate(header.templateId)) {
-            throw std::runtime_error("Unexpected template for trade message");
-        }
-
-        size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        const size_t actualPayloadSize = header.blockLength;
+    // Main decode function (follows official main.cpp logic exactly)
+    py::dict decode_message(const py::bytes& data) {
+        auto storage = read_payload_from_python(data);
+        auto payload = std::span<char>{storage};
+        MessageHeader message_header{payload.data(), payload.size()};
         
-        if (payloadOffset + actualPayloadSize > size) {
-            throw std::runtime_error("Invalid trade message size: expected " + 
-                                   std::to_string(actualPayloadSize) + " bytes, got " + 
-                                   std::to_string(size - payloadOffset) + " bytes");
+        // A separate "ErrorResponse" message is returned for errors and its format
+        // is expected to be backwards compatible across all schema IDs.
+        auto template_id = message_header.templateId();
+        if (template_id == ErrorResponse::sbeTemplateId()) {
+            const auto result = decode_error_response(payload, message_header);
+            return convert_error_to_dict(result);
         }
-
-        TradeStreamMessage trade{};
-        std::memcpy(&trade, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(TradeStreamMessage)));
-
+        
+        const auto schema_id = message_header.schemaId();
+        if (schema_id != ExchangeInfoResponse::sbeSchemaId()) {
+            throw std::runtime_error("Unexpected schema ID " + std::to_string(schema_id));
+        }
+        const auto version = message_header.version();
+        if (version != ExchangeInfoResponse::sbeSchemaVersion()) {
+            // Schemas with the same ID are expected to be backwards compatible.
+            // Log warning but continue
+        }
+        
+        std::optional<WebSocketMetadata> websocket_meta;
+        if (template_id == WebSocketResponse::sbeTemplateId()) {
+            websocket_meta = decode_websocket_response(payload, message_header);
+            payload = websocket_meta->result;
+            message_header = MessageHeader{payload.data(), payload.size()};
+            template_id = message_header.templateId();
+            
+            if (template_id == ErrorResponse::sbeTemplateId()) {
+                const auto result = decode_error_response(payload, message_header);
+                auto dict = convert_error_to_dict(result);
+                add_websocket_metadata(dict, websocket_meta);
+                return dict;
+            }
+        }
+        
         py::dict result;
-        result["symbol"] = extractSymbol(trade.symbol);
-        result["event_ts"] = microsToMillis(trade.eventTime);
-        result["ingest_ts"] = getCurrentTimeMillis();
-        result["trade_time"] = microsToMillis(trade.tradeTime);
-        auto tradeId = static_cast<long long>(trade.tradeId);
-        result["trade_id"] = tradeId;
-        result["price"] = decodeDecimal(trade.price, trade.priceExponent);
-        result["qty"] = decodeDecimal(trade.quantity, trade.quantityExponent);
-        result["is_buyer_maker"] = static_cast<bool>(trade.isBuyerMaker);
-        result["source"] = "sbe";
-        result["msg_type"] = "trade";
+        
+        if (template_id == AccountResponse::sbeTemplateId()) {
+            const auto account_result = decode_account(payload, message_header);
+            result = convert_account_to_dict(account_result);
+        } else if (template_id == ExchangeInfoResponse::sbeTemplateId()) {
+            const auto exchange_info_result = decode_exchange_info(payload, message_header);
+            result = convert_exchange_info_to_dict(exchange_info_result);
+        } else if (template_id == NewOrderResultResponse::sbeTemplateId()) {
+            const auto new_order_result = decode_post_order(payload, message_header);
+            result = convert_new_order_to_dict(new_order_result);
+        } else if (template_id == OrderResponse::sbeTemplateId()) {
+            const auto order_result = decode_get_order(payload, message_header);
+            result = convert_get_order_to_dict(order_result);
+        } else {
+            throw std::runtime_error("Unexpected template ID " + std::to_string(template_id));
+        }
+        
+        if (websocket_meta) {
+            add_websocket_metadata(result, websocket_meta);
+        }
         
         return result;
     }
     
-    // Decode best bid/ask stream message (BestBidAskStreamEvent)
-    py::dict decodeBestBidAsk(const py::bytes& data) {
-        const char* buffer = PyBytes_AsString(data.ptr());
-        size_t size = PyBytes_Size(data.ptr());
-
-        auto headerInfo = locateSbeHeader(buffer, size);
-        if (!headerInfo.has_value()) {
-            throw std::runtime_error("SBE best bid/ask header not found");
+    // Get message template ID
+    uint16_t get_template_id(const py::bytes& data) {
+        auto storage = read_payload_from_python(data);
+        auto payload = std::span<char>{storage};
+        MessageHeader message_header{payload.data(), payload.size()};
+        return message_header.templateId();
+    }
+    
+    // Validate message format
+    bool is_valid_message(const py::bytes& data) {
+        try {
+            auto storage = read_payload_from_python(data);
+            auto payload = std::span<char>{storage};
+            MessageHeader message_header{payload.data(), payload.size()};
+            
+            const auto schema_id = message_header.schemaId();
+            return schema_id == ExchangeInfoResponse::sbeSchemaId();
+        } catch (...) {
+            return false;
         }
+    }
 
-        const MessageHeader& header = headerInfo->header;
-        if (!isBestBidAskTemplate(header.templateId)) {
-            throw std::runtime_error("Unexpected template for best bid/ask message");
-        }
-
-        size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        const size_t actualPayloadSize = header.blockLength;
-        
-        if (payloadOffset + actualPayloadSize > size) {
-            throw std::runtime_error("Invalid best bid/ask message size: expected " + 
-                                   std::to_string(actualPayloadSize) + " bytes, got " + 
-                                   std::to_string(size - payloadOffset) + " bytes");
-        }
-
-        BestBidAskMessage ticker{};
-        std::memcpy(&ticker, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(BestBidAskMessage)));
-
+private:
+    // Convert Error to Python dict
+    py::dict convert_error_to_dict(const Error& error) {
         py::dict result;
-        result["symbol"] = extractSymbol(ticker.symbol);
-        result["event_ts"] = microsToMillis(ticker.eventTime);
-        result["ingest_ts"] = getCurrentTimeMillis();
-        result["bid_px"] = decodeDecimal(ticker.bidPrice, ticker.bidPriceExponent);
-        result["bid_sz"] = decodeDecimal(ticker.bidQuantity, ticker.bidQuantityExponent);
-        result["ask_px"] = decodeDecimal(ticker.askPrice, ticker.askPriceExponent);
-        result["ask_sz"] = decodeDecimal(ticker.askQuantity, ticker.askQuantityExponent);
+        result["msg_type"] = "error";
         result["source"] = "sbe";
-        result["msg_type"] = "bestBidAsk";
+        result["error"] = true;
+        result["code"] = error.code;
+        result["msg"] = error.msg;
+        if (error.server_time) {
+            result["server_time"] = *error.server_time;
+        }
+        if (error.retry_after) {
+            result["retry_after"] = *error.retry_after;
+        }
+        return result;
+    }
+    
+    // Convert Account to Python dict
+    py::dict convert_account_to_dict(const Account& account) {
+        py::dict result;
+        result["msg_type"] = "account";
+        result["source"] = "sbe";
+        result["can_trade"] = account.can_trade;
+        result["can_withdraw"] = account.can_withdraw;
+        result["can_deposit"] = account.can_deposit;
+        result["brokered"] = account.brokered;
+        result["require_self_trade_prevention"] = account.require_self_trade_prevention;
+        result["prevent_sor"] = account.prevent_sor;
+        result["update_time"] = account.update_time;
+        result["uid"] = account.uid;
+        
+        if (account.trade_group_id) {
+            result["trade_group_id"] = *account.trade_group_id;
+        }
+        
+        // Convert balances
+        py::list balances;
+        for (const auto& balance : account.balances) {
+            py::dict balance_dict;
+            balance_dict["asset"] = balance.asset;
+            balance_dict["free"] = balance.free.mantissa * std::pow(10.0, balance.free.exponent);
+            balance_dict["locked"] = balance.locked.mantissa * std::pow(10.0, balance.locked.exponent);
+            balances.append(balance_dict);
+        }
+        result["balances"] = balances;
+        
+        // Convert permissions
+        py::list permissions;
+        for (const auto& permission : account.permissions) {
+            permissions.append(permission);
+        }
+        result["permissions"] = permissions;
         
         return result;
     }
     
-    // Decode depth diff stream message (DepthDiffStreamEvent)
-    py::dict decodeDepthDiff(const py::bytes& data) {
-        const char* buffer = PyBytes_AsString(data.ptr());
-        size_t size = PyBytes_Size(data.ptr());
-
-        auto headerInfo = locateSbeHeader(buffer, size);
-        if (!headerInfo.has_value()) {
-            throw std::runtime_error("SBE depth diff header not found");
-        }
-
-        const MessageHeader& header = headerInfo->header;
-        if (!isDepthDiffTemplate(header.templateId)) {
-            throw std::runtime_error("Unexpected template for depth diff message");
-        }
-
-        size_t payloadOffset = headerInfo->offset + sizeof(MessageHeader);
-        const size_t actualPayloadSize = header.blockLength;
-        
-        if (payloadOffset + actualPayloadSize > size) {
-            throw std::runtime_error("Invalid depth diff message size: expected " + 
-                                   std::to_string(actualPayloadSize) + " bytes, got " + 
-                                   std::to_string(size - payloadOffset) + " bytes");
-        }
-
-        DepthDiffMessage depth{};
-        std::memcpy(&depth, buffer + payloadOffset, std::min(actualPayloadSize, sizeof(DepthDiffMessage)));
-
+    // Convert ExchangeInfo to Python dict
+    py::dict convert_exchange_info_to_dict(const ExchangeInfo& exchange_info) {
         py::dict result;
-        result["symbol"] = extractSymbol(depth.symbol);
-        result["event_ts"] = microsToMillis(depth.eventTime);
-        result["ingest_ts"] = getCurrentTimeMillis();
-        auto firstUpdateId = static_cast<unsigned long long>(depth.firstUpdateId);
-        auto finalUpdateId = static_cast<unsigned long long>(depth.finalUpdateId);
-        result["first_update_id"] = firstUpdateId;
-        result["final_update_id"] = finalUpdateId;
-
-        // Parse variable-length bid/ask arrays
-        const char* priceDataStart = buffer + payloadOffset + sizeof(DepthDiffMessage);
-        size_t remainingSize = size - (payloadOffset + sizeof(DepthDiffMessage));
-
-        py::list bids, asks;
-        size_t offset = 0;
-
-        // Parse bids
-        for (uint16_t i = 0; i < depth.bidCount && offset + sizeof(PriceLevel) <= remainingSize; ++i) {
-            PriceLevel level{};
-            std::memcpy(&level, priceDataStart + offset, sizeof(PriceLevel));
-            py::dict bid;
-            bid["price"] = decodeDecimal(level.price, level.priceExponent);
-            bid["qty"] = decodeDecimal(level.quantity, level.quantityExponent);
-            bids.append(bid);
-            offset += sizeof(PriceLevel);
-        }
-
-        // Parse asks
-        for (uint16_t i = 0; i < depth.askCount && offset + sizeof(PriceLevel) <= remainingSize; ++i) {
-            PriceLevel level{};
-            std::memcpy(&level, priceDataStart + offset, sizeof(PriceLevel));
-            py::dict ask;
-            ask["price"] = decodeDecimal(level.price, level.priceExponent);
-            ask["qty"] = decodeDecimal(level.quantity, level.quantityExponent);
-            asks.append(ask);
-            offset += sizeof(PriceLevel);
-        }
-        
-        result["bids"] = bids;
-        result["asks"] = asks;
+        result["msg_type"] = "exchangeInfo";
         result["source"] = "sbe";
-        result["msg_type"] = "depthDiff";
+        
+        // Convert rate limits
+        py::list rate_limits;
+        for (const auto& rate_limit : exchange_info.rate_limits) {
+            py::dict limit_dict;
+            limit_dict["rate_limit_type"] = static_cast<int>(rate_limit.rate_limit_type);
+            limit_dict["interval"] = static_cast<int>(rate_limit.interval);
+            limit_dict["interval_num"] = rate_limit.interval_num;
+            limit_dict["limit"] = rate_limit.rate_limit;
+            rate_limits.append(limit_dict);
+        }
+        result["rate_limits"] = rate_limits;
+        
+        // Convert symbols
+        py::list symbols;
+        for (const auto& symbol : exchange_info.symbols) {
+            py::dict symbol_dict;
+            symbol_dict["symbol"] = symbol.symbol;
+            symbol_dict["status"] = static_cast<int>(symbol.status);
+            symbol_dict["base_asset"] = symbol.base_asset;
+            symbol_dict["quote_asset"] = symbol.quote_asset;
+            symbol_dict["base_asset_precision"] = symbol.base_asset_precision;
+            symbol_dict["quote_asset_precision"] = symbol.quote_asset_precision;
+            symbol_dict["iceberg_allowed"] = symbol.iceberg_allowed;
+            symbol_dict["oco_allowed"] = symbol.oco_allowed;
+            symbol_dict["is_spot_trading_allowed"] = symbol.is_spot_trading_allowed;
+            symbol_dict["is_margin_trading_allowed"] = symbol.is_margin_trading_allowed;
+            symbols.append(symbol_dict);
+        }
+        result["symbols"] = symbols;
         
         return result;
     }
     
-    // Get message template ID from SBE header
-    uint16_t getMessageType(const py::bytes& data) {
-        const char* buffer = PyBytes_AsString(data.ptr());
-        size_t size = PyBytes_Size(data.ptr());
-
-        auto headerInfo = locateSbeHeader(buffer, size);
-        if (!headerInfo.has_value()) {
-            return 0;
+    // Convert NewOrder to Python dict
+    py::dict convert_new_order_to_dict(const NewOrder& new_order) {
+        py::dict result;
+        result["msg_type"] = "newOrder";
+        result["source"] = "sbe";
+        result["symbol"] = new_order.symbol;
+        result["order_id"] = new_order.order_id;
+        result["client_order_id"] = new_order.client_order_id;
+        result["transaction_time"] = new_order.transaction_time;
+        result["price"] = new_order.price.mantissa * std::pow(10.0, new_order.price.exponent);
+        result["orig_qty"] = new_order.orig_qty.mantissa * std::pow(10.0, new_order.orig_qty.exponent);
+        result["executed_qty"] = new_order.executed_qty.mantissa * std::pow(10.0, new_order.executed_qty.exponent);
+        result["status"] = static_cast<int>(new_order.status);
+        result["side"] = static_cast<int>(new_order.side);
+        
+        if (new_order.order_list_id) {
+            result["order_list_id"] = *new_order.order_list_id;
         }
-
-        return headerInfo->header.templateId;
+        
+        return result;
     }
     
-    // Validate message format and schema
-    bool isValidMessage(const py::bytes& data) {
-        const char* buffer = PyBytes_AsString(data.ptr());
-        size_t size = PyBytes_Size(data.ptr());
-        return locateSbeHeader(buffer, size).has_value();
+    // Convert GetOrder to Python dict
+    py::dict convert_get_order_to_dict(const GetOrder& get_order) {
+        py::dict result;
+        result["msg_type"] = "order";
+        result["source"] = "sbe";
+        result["symbol"] = get_order.symbol;
+        result["order_id"] = get_order.order_id;
+        result["client_order_id"] = get_order.client_order_id;
+        result["price"] = get_order.price.mantissa * std::pow(10.0, get_order.price.exponent);
+        result["orig_qty"] = get_order.orig_qty.mantissa * std::pow(10.0, get_order.orig_qty.exponent);
+        result["executed_qty"] = get_order.executed_qty.mantissa * std::pow(10.0, get_order.executed_qty.exponent);
+        result["status"] = static_cast<int>(get_order.status);
+        result["side"] = static_cast<int>(get_order.side);
+        result["time"] = get_order.time;
+        result["update_time"] = get_order.update_time;
+        result["is_working"] = get_order.is_working;
+        
+        if (get_order.order_list_id) {
+            result["order_list_id"] = *get_order.order_list_id;
+        }
+        
+        return result;
     }
     
-    // Decode any SBE message based on template ID
-    py::dict decodeMessage(const py::bytes& data) {
-        uint16_t templateId = getMessageType(data);
-
-        if (isTradeTemplate(templateId)) {
-            return decodeTrade(data);
+    // Add WebSocket metadata to result
+    void add_websocket_metadata(py::dict& result, const std::optional<WebSocketMetadata>& websocket_meta) {
+        if (websocket_meta) {
+            result["ws_status"] = websocket_meta->status;
+            result["ws_id"] = websocket_meta->id;
+            
+            py::list rate_limits;
+            for (const auto& limit : websocket_meta->rate_limits) {
+                py::dict limit_dict;
+                limit_dict["rate_limit_type"] = limit.rate_limit_type;
+                limit_dict["interval"] = limit.interval;
+                limit_dict["interval_num"] = limit.interval_num;
+                limit_dict["limit"] = limit.rate_limit;
+                limit_dict["current"] = limit.current;
+                rate_limits.append(limit_dict);
+            }
+            result["ws_rate_limits"] = rate_limits;
         }
-        if (isBestBidAskTemplate(templateId)) {
-            return decodeBestBidAsk(data);
-        }
-        if (isDepthDiffTemplate(templateId)) {
-            return decodeDepthDiff(data);
-        }
-
-        throw std::runtime_error("Unknown SBE message template ID: " + std::to_string(templateId));
     }
 };
 
 PYBIND11_MODULE(sbe_decoder_cpp, m) {
-    m.doc() = "High-performance C++ SBE decoder for Binance market data (following official sample patterns)";
+    m.doc() = "Python bindings for official Binance SBE C++ decoder";
     
-    py::class_<SBEDecoder>(m, "SBEDecoder")
+    py::class_<BinanceSBEDecoder>(m, "SBEDecoder")
         .def(py::init<>())
-        .def("decode_trade", &SBEDecoder::decodeTrade, "Decode SBE trade stream message")
-        .def("decode_best_bid_ask", &SBEDecoder::decodeBestBidAsk, "Decode SBE best bid/ask stream message")
-        .def("decode_depth_diff", &SBEDecoder::decodeDepthDiff, "Decode SBE depth diff stream message")
-        .def("decode_message", &SBEDecoder::decodeMessage, "Auto-decode SBE message based on template ID")
-        .def("get_message_type", &SBEDecoder::getMessageType, "Get SBE message template ID")
-        .def("is_valid_message", &SBEDecoder::isValidMessage, "Validate SBE message format and schema");
+        .def("decode_message", &BinanceSBEDecoder::decode_message, "Decode SBE message using official Binance patterns")
+        .def("get_template_id", &BinanceSBEDecoder::get_template_id, "Get SBE message template ID")
+        .def("is_valid_message", &BinanceSBEDecoder::is_valid_message, "Validate SBE message format");
     
-    // Export Binance SBE template IDs (schema 1:0 defaults)
-    m.attr("TRADES_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::TRADES_STREAM_EVENT);
-    m.attr("BEST_BID_ASK_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::BEST_BID_ASK_STREAM_EVENT);
-    m.attr("DEPTH_DIFF_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT);
-    m.attr("DEPTH_DIFF_STREAM_EVENT_V2") = static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT_V2);
+    // Export official template IDs from Binance SBE
+    m.attr("ACCOUNT_RESPONSE_TEMPLATE_ID") = AccountResponse::sbeTemplateId();
+    m.attr("EXCHANGE_INFO_RESPONSE_TEMPLATE_ID") = ExchangeInfoResponse::sbeTemplateId();
+    m.attr("NEW_ORDER_RESULT_RESPONSE_TEMPLATE_ID") = NewOrderResultResponse::sbeTemplateId();
+    m.attr("ORDER_RESPONSE_TEMPLATE_ID") = OrderResponse::sbeTemplateId();
+    m.attr("ERROR_RESPONSE_TEMPLATE_ID") = ErrorResponse::sbeTemplateId();
+    m.attr("WEBSOCKET_RESPONSE_TEMPLATE_ID") = WebSocketResponse::sbeTemplateId();
     
-    // Export schema constants
-    m.attr("EXPECTED_SCHEMA_ID") = BINANCE_SBE_SCHEMA_ID;
-    m.attr("EXPECTED_SCHEMA_VERSION") = BINANCE_SBE_SCHEMA_VERSION;
+    // Export official schema constants
+    m.attr("EXPECTED_SCHEMA_ID") = ExchangeInfoResponse::sbeSchemaId();
+    m.attr("EXPECTED_SCHEMA_VERSION") = ExchangeInfoResponse::sbeSchemaVersion();
 }

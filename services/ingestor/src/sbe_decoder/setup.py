@@ -27,6 +27,9 @@ ext_modules = [
             pybind11.get_include(),
             # Local source headers
             "src/",
+            # Official Binance SBE headers
+            "include/",
+            "include/spot_sbe/",
         ],
         language='c++',
         cxx_std=20,  # C++20 for std::span and performance features
@@ -50,7 +53,7 @@ setup(
     version="1.0.0",
     author="Bitcoin Pipeline Team",
     description="High-performance C++ SBE decoder for Binance WebSocket streams",
-    long_description="Fast C++ extension for decoding Binance SBE binary market data from WebSocket streams (schema 3:1)",
+    long_description="Fast C++ extension for decoding Binance SBE binary market data from WebSocket streams (official integration)",
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
     zip_safe=False,
