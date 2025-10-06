@@ -17,6 +17,9 @@
 #include <cstring>
 #include <cmath>
 #include <chrono>
+#include <algorithm>
+#include <stdexcept>
+#include <cstdio>
 
 // Include official Binance SBE headers
 #include "spot_sbe/MessageHeader.h"
@@ -34,6 +37,40 @@ namespace py = pybind11;
 using spot_sbe::MessageHeader;
 using spot_sbe::ErrorResponse;
 using spot_sbe::BoolEnum;
+
+namespace {
+
+template <typename T>
+T read_little_endian(const char *data, std::size_t data_size, std::size_t &offset)
+{
+    if (offset + sizeof(T) > data_size)
+    {
+        throw std::runtime_error("SBE decode: truncated buffer");
+    }
+
+    T value{};
+    std::memcpy(&value, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return value;
+}
+
+std::string preview_next_bytes_hex(const char *data, std::size_t data_size, std::size_t offset, std::size_t count)
+{
+    std::size_t preview_len = std::min(count, data_size > offset ? data_size - offset : 0);
+    std::string hex;
+    hex.reserve(preview_len * 2);
+
+    for (std::size_t i = 0; i < preview_len; ++i)
+    {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(data[offset + i]));
+        hex.append(buf);
+    }
+
+    return hex;
+}
+
+} // namespace
 
 // Stream template IDs for WebSocket streams (as expected by binance_sbe.py)
 constexpr uint16_t TRADES_STREAM_EVENT = 10000;
@@ -190,159 +227,104 @@ private:
         const char* data = payload.data() + MessageHeader::encodedLength();
         size_t data_size = payload.size() - MessageHeader::encodedLength();
         size_t offset = 0;
-        
+
         try {
-            // Based on Binance SBE documentation:
-            // - Exponent field always precedes mantissa field
-            // - Fields are encoded separately as primitives (not composite)
-            // - Template has blockLength = 18 for trades
-            
-            // Fixed block (18 bytes for template 10000):
-            // Event timestamp (8 bytes) - microseconds since epoch
-            if (offset + 8 <= data_size) {
-                uint64_t event_time = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["event_ts"] = micros_to_millis(event_time);
-                offset += 8;
+            if (data_size < message_header.blockLength()) {
+                throw std::runtime_error("SBE trade decode: payload shorter than block length");
             }
-            
-            // Trade execution timestamp (8 bytes) - microseconds since epoch  
-            if (offset + 8 <= data_size) {
-                uint64_t trade_time = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["trade_time"] = micros_to_millis(trade_time);
-                offset += 8;
-            }
-            
-            // Price exponent (1 byte) 
-            int8_t price_exponent = -8; // Default assumption
-            if (offset + 1 <= data_size) {
-                price_exponent = *reinterpret_cast<const int8_t*>(data + offset);
-                result["price_exponent"] = static_cast<int>(price_exponent);
-                offset += 1;
-            }
-            
-            // Quantity exponent (1 byte)
-            int8_t qty_exponent = -8; // Default assumption
-            if (offset + 1 <= data_size) {
-                qty_exponent = *reinterpret_cast<const int8_t*>(data + offset);
-                result["qty_exponent"] = static_cast<int>(qty_exponent);
-                offset += 1;
-            }
-            
-            // Parse the "trades" repeating group based on official stream_1_0.xml
-            // Structure: Group header (blockLength + numInGroup) followed by trade entries
-            
-            // Skip to start of variable groups section (may have padding)
-            while (offset < message_header.blockLength() && offset < data_size) {
-                offset++;
-            }
-            
-            // Based on template 10000 with blockLength=18:
-            // Fixed block: eventTime(8) + transactTime(8) + priceExp(1) + qtyExp(1) = 18 bytes
-            // Then comes variable section with f8f8 marker
-            
-            // Parse raw bytes: f8f8190001000000
-            // Expected: f8f8 + 1900(25) + 0100(1) + trade_data
-            
-            result["debug_offset_fixed_end"] = static_cast<int>(offset);
+
+            // Fixed block (18 bytes for template 10000)
+            uint64_t event_time = read_little_endian<uint64_t>(data, data_size, offset);
+            uint64_t trade_time = read_little_endian<uint64_t>(data, data_size, offset);
+            int8_t price_exponent = read_little_endian<int8_t>(data, data_size, offset);
+            int8_t qty_exponent = read_little_endian<int8_t>(data, data_size, offset);
+
+            result["event_ts"] = micros_to_millis(event_time);
+            result["trade_time"] = micros_to_millis(trade_time);
+            result["price_exponent"] = static_cast<int>(price_exponent);
+            result["qty_exponent"] = static_cast<int>(qty_exponent);
+
+            // Debug preview of upcoming bytes for troubleshooting
+            result["debug_offset_fixed_end"] = static_cast<int>(message_header.blockLength());
             result["debug_data_size"] = static_cast<int>(data_size);
-            
-            // Print next 16 bytes for debugging
-            if (offset + 16 <= data_size) {
-                std::string hex_debug = "";
-                for (size_t i = 0; i < 16; i++) {
-                    char hex[3];
-                    sprintf(hex, "%02x", (unsigned char)data[offset + i]);
-                    hex_debug += hex;
-                }
-                result["debug_next_16_bytes"] = hex_debug;
+            result["debug_next_16_bytes"] = preview_next_bytes_hex(data, data_size, offset, 16);
+
+            // Repeating group header (blockLength + numInGroup)
+            uint16_t group_block_length = read_little_endian<uint16_t>(data, data_size, offset);
+            uint32_t num_in_group = read_little_endian<uint32_t>(data, data_size, offset);
+
+            if (group_block_length == 0 || num_in_group == 0) {
+                throw std::runtime_error("SBE trade decode: empty trade group");
             }
-            
-            // The issue: we need to look at WHERE f8f8 actually is in the next_16_bytes
-            // From debug: next_16_bytes=190001000000f04a373b01000000408b
-            // This means: 1900(blockLen) 0100(numInGroup) 000000(padding?) f04a373b01000000408b(trade data)
-            // So f8f8 is NOT at current offset, but the group data starts immediately!
-            
-            // Let's try parsing directly without looking for f8f8, since it's not where expected
-            if (offset + 6 <= data_size) { // Need at least blockLen(2) + numInGroup(2) + some trade data
-                // Try reading as if we're already past f8f8
-                uint16_t group_block_length = *reinterpret_cast<const uint16_t*>(data + offset);
-                uint16_t num_in_group = *reinterpret_cast<const uint16_t*>(data + offset + 2);
-                
-                result["debug_direct_block_length"] = static_cast<int>(group_block_length);
-                result["debug_direct_num_in_group"] = static_cast<int>(num_in_group);
-                
-                // Looks like blockLength=25 (0x1900) and numInGroup=1 (0x0100) - this makes sense!
-                if (group_block_length == 25 && num_in_group >= 1) {
-                    // Skip potential padding and read trade data
-                    // Pattern: 190001000000f04a373b01000000408b
-                    // After group header: 000000f04a373b01000000408b
-                    // It looks like there might be 3 bytes of padding: 000000
-                    
-                    size_t trade_data_start = offset + 4 + 3; // group header (4) + padding (3)
-                    result["debug_trade_data_start"] = static_cast<int>(trade_data_start);
-                    
-                    if (trade_data_start + 24 <= data_size) { // Need 24 bytes: id(8)+price(8)+qty(8)
-                        // Read trade fields directly: f04a373b01000000408b...
-                        uint64_t trade_id = *reinterpret_cast<const uint64_t*>(data + trade_data_start);
-                        int64_t price_mantissa = *reinterpret_cast<const int64_t*>(data + trade_data_start + 8);
-                        int64_t qty_mantissa = *reinterpret_cast<const int64_t*>(data + trade_data_start + 16);
-                        
-                        // Apply the SAME decimal conversion as BBA (which works!)
-                        result["price"] = decode_decimal(price_mantissa, price_exponent);
-                        result["qty"] = decode_decimal(qty_mantissa, qty_exponent);
-                        result["trade_id"] = static_cast<unsigned long long>(trade_id);
-                        
-                        result["debug_price_mantissa"] = static_cast<long long>(price_mantissa);
-                        result["debug_qty_mantissa"] = static_cast<long long>(qty_mantissa);
-                        result["debug_found_group"] = true;
-                    }
-                } else {
-                    result["debug_found_group"] = false;
+
+            result["debug_group_block_length"] = static_cast<int>(group_block_length);
+            result["debug_num_in_group"] = static_cast<long long>(num_in_group);
+
+            size_t group_start = offset;
+            double price = 0.0;
+            double qty = 0.0;
+            uint64_t trade_id = 0;
+            bool is_buyer_maker = false;
+            int64_t price_mantissa = 0;
+            int64_t qty_mantissa = 0;
+            bool populated = false;
+
+            for (uint32_t i = 0; i < num_in_group; ++i) {
+                size_t entry_offset = group_start + static_cast<size_t>(i) * group_block_length;
+                if (entry_offset + group_block_length > data_size) {
+                    throw std::runtime_error("SBE trade decode: group entry exceeds buffer");
+                }
+
+                size_t cursor = entry_offset;
+                uint64_t entry_trade_id = read_little_endian<uint64_t>(data, data_size, cursor);
+                int64_t entry_price_mantissa = read_little_endian<int64_t>(data, data_size, cursor);
+                int64_t entry_qty_mantissa = read_little_endian<int64_t>(data, data_size, cursor);
+                bool entry_is_buyer_maker = false;
+
+                if (cursor < entry_offset + group_block_length) {
+                    uint8_t maker_flag = read_little_endian<uint8_t>(data, data_size, cursor);
+                    entry_is_buyer_maker = maker_flag != 0;
+                }
+
+                if (!populated) {
+                    trade_id = entry_trade_id;
+                    price_mantissa = entry_price_mantissa;
+                    qty_mantissa = entry_qty_mantissa;
+                    price = decode_decimal(entry_price_mantissa, price_exponent);
+                    qty = decode_decimal(entry_qty_mantissa, qty_exponent);
+                    is_buyer_maker = entry_is_buyer_maker;
+                    populated = true;
                 }
             }
-            
-            // Fallback values if decoding failed
-            if (!result.contains("price")) {
-                result["price"] = 124410.0; // Use reasonable fallback
-            }
-            if (!result.contains("qty")) {
-                result["qty"] = 0.0001; // Use reasonable fallback
-            }
-            
-            // Trade ID (likely 8 bytes)
-            if (offset + 8 <= data_size) {
-                uint64_t trade_id = *reinterpret_cast<const uint64_t*>(data + offset);
-                result["trade_id"] = static_cast<long long>(trade_id);
-                offset += 8;
-            }
-            
-            // Buyer maker flag (1 byte)
-            if (offset + 1 <= data_size) {
-                bool is_buyer_maker = (*reinterpret_cast<const uint8_t*>(data + offset)) != 0;
-                result["is_buyer_maker"] = is_buyer_maker;
-                offset += 1;
-            }
-            
-            // Parse symbol from remaining data if any
+
+            offset = group_start + static_cast<size_t>(num_in_group) * group_block_length;
+
+            // Symbol is encoded as length-prefixed string in the remaining bytes
+            std::string symbol = "BTCUSDT";
             if (offset < data_size) {
-                std::string symbol;
-                // Look for printable characters that could be symbol
-                for (size_t i = offset; i < data_size && i < offset + 16; ++i) {
-                    char c = data[i];
-                    if (c == '\0') break;
-                    if (std::isalnum(c)) {
-                        symbol += c;
+                uint8_t symbol_length = read_little_endian<uint8_t>(data, data_size, offset);
+                if (symbol_length > 0) {
+                    if (offset + symbol_length > data_size) {
+                        throw std::runtime_error("SBE trade decode: symbol exceeds buffer");
                     }
+                    symbol.assign(data + offset, data + offset + symbol_length);
+                    offset += symbol_length;
                 }
-                result["symbol"] = symbol.empty() ? "BTCUSDT" : symbol;
-            } else {
-                result["symbol"] = "BTCUSDT";
             }
-            
-            // Set reasonable defaults for missing fields
-            if (!result.contains("trade_id")) result["trade_id"] = 0;
-            if (!result.contains("is_buyer_maker")) result["is_buyer_maker"] = false;
-            
+
+            if (!populated) {
+                throw std::runtime_error("SBE trade decode: no trade entries parsed");
+            }
+
+            result["symbol"] = symbol;
+            result["price"] = price;
+            result["qty"] = qty;
+            result["trade_id"] = static_cast<unsigned long long>(trade_id);
+            result["is_buyer_maker"] = is_buyer_maker;
+            result["debug_price_mantissa"] = static_cast<long long>(price_mantissa);
+            result["debug_qty_mantissa"] = static_cast<long long>(qty_mantissa);
+            result["debug_found_group"] = true;
+
         } catch (const std::exception& e) {
             // If parsing fails, return placeholder values
             result["symbol"] = "PARSE_ERROR";
@@ -352,6 +334,7 @@ private:
             result["trade_time"] = get_current_time_millis();
             result["trade_id"] = 0;
             result["is_buyer_maker"] = false;
+            result["debug_found_group"] = false;
             result["parse_error"] = std::string(e.what());
         }
         
