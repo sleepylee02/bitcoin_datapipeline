@@ -27,9 +27,10 @@ constexpr uint16_t CURRENT_SCHEMA_VERSION = 0;
 
 // WebSocket SBE stream template IDs (from Binance schema 1:0)
 enum class StreamTemplateId : uint16_t {
-    TRADES_STREAM_EVENT = 10000,           // <symbol>@trade
-    BEST_BID_ASK_STREAM_EVENT = 10001,     // <symbol>@bestBidAsk 
-    DEPTH_DIFF_STREAM_EVENT = 10002        // <symbol>@depth
+    TRADES_STREAM_EVENT = 10000,            // <symbol>@trade
+    BEST_BID_ASK_STREAM_EVENT = 10001,      // <symbol>@bestBidAsk 
+    DEPTH_DIFF_STREAM_EVENT = 10002,        // <symbol>@depth
+    DEPTH_DIFF_STREAM_EVENT_V2 = 10003      // <symbol>@depth (schema variant)
 };
 
 // SBE message header structure

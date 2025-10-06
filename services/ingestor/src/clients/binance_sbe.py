@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class SBEMessageType(Enum):
     """SBE message types from Binance."""
     TRADE = "trade"
-    BEST_BID_ASK = "bookTicker"
+    BEST_BID_ASK = "bestBidAsk"
     DEPTH = "depth"
     PARTIAL_DEPTH = "depth@100ms"
 
@@ -217,72 +217,138 @@ class BinanceSBEClient:
                 return None
             
             # Debug: Check the actual schema version and message content
+            header = None
             if len(raw_message) >= 8:  # Minimum size for SBE header
                 import struct
                 header = struct.unpack('<HHHH', raw_message[:8])  # little-endian: blockLength, templateId, schemaId, version
-                logger.info(f"🔍 SBE Header - blockLength: {header[0]}, templateId: {header[1]}, schemaId: {header[2]}, version: {header[3]}")
+                logger.info(
+                    f"🔍 SBE Header - blockLength: {header[0]}, templateId: {header[1]}, schemaId: {header[2]}, version: {header[3]}"
+                )
                 logger.info(f"🔍 Message size: {len(raw_message)} bytes")
                 logger.info(f"🔍 Raw bytes (first 32): {raw_message[:32].hex()}")
             
             # Validate message format first
             if not self.sbe_decoder.is_valid_message(raw_message):
-                logger.warning(f"Invalid SBE message format or schema version. Expected schema {EXPECTED_SCHEMA_ID}:{EXPECTED_SCHEMA_VERSION}")
-                logger.warning(f"Received: schemaId={header[2]}, version={header[3]}, templateId={header[1]}")
+                logger.warning(
+                    f"Invalid SBE message format or schema version. Expected schema {EXPECTED_SCHEMA_ID}:{EXPECTED_SCHEMA_VERSION}"
+                )
+                if header:
+                    logger.warning(
+                        f"Received: schemaId={header[2]}, version={header[3]}, templateId={header[1]}"
+                    )
+                else:
+                    logger.warning("Received message too short to inspect header")
                 return None
             
-            # TEMPORARY: Use header-only parsing until proper SBE schema is implemented
             try:
-                import struct
-                header = struct.unpack('<HHHH', raw_message[:8])
+                decoded = self.sbe_decoder.decode_message(raw_message)
+            except RuntimeError as e:
+                logger.warning(f"Failed to decode SBE message: {e}")
+                return None
+
+            msg_type = decoded.get('msg_type')
+            type_map = {
+                'trade': SBEMessageType.TRADE,
+                'bestBidAsk': SBEMessageType.BEST_BID_ASK,
+                'bookTicker': SBEMessageType.BEST_BID_ASK,
+                'depth': SBEMessageType.DEPTH,
+                'depthDiff': SBEMessageType.DEPTH,
+                'depth@100ms': SBEMessageType.PARTIAL_DEPTH,
+            }
+
+            message_type = type_map.get(msg_type)
+            if not message_type and header:
                 template_id = header[1]
-                
-                # Map template IDs to message types (flexible mapping)
                 template_to_type = {
-                    10000: ('trade', SBEMessageType.TRADE),
-                    10001: ('bookTicker', SBEMessageType.BEST_BID_ASK), 
-                    10002: ('depth', SBEMessageType.DEPTH),
-                    # Add more template IDs as we discover them
+                    10000: SBEMessageType.TRADE,
+                    10001: SBEMessageType.BEST_BID_ASK,
+                    10002: SBEMessageType.DEPTH,
+                    10003: SBEMessageType.DEPTH,
                 }
-                
-                msg_type_str, message_type = template_to_type.get(template_id, ('unknown', None))
-                
-                # Create minimal decoded data from header info
-                decoded_data = {
-                    'template_id': template_id,
-                    'schema_id': header[2], 
-                    'version': header[3],
-                    'block_length': header[0],
-                    'source': 'sbe',
-                    'msg_type': msg_type_str,
-                    'symbol': 'BTCUSDT',  # Hardcoded for now since we know the stream
-                    'event_ts': int(time.time() * 1000000),  # Current time in microseconds
-                    'ingest_ts': int(time.time() * 1000000),
-                    'raw_size': len(raw_message)
-                }
-                
+                message_type = template_to_type.get(template_id)
                 if not message_type:
                     logger.info(f"📋 Discovered new template ID: {template_id} - add to mapping if needed")
-                    # Return a generic message for unknown templates
-                    message_type = SBEMessageType.TRADE  # Fallback to trade type
-                
-                return SBEMessage(
-                    message_type=message_type,
-                    symbol='BTCUSDT',
-                    event_time=decoded_data['event_ts'],
-                    data=decoded_data,
-                    raw_message=f"SBE template={template_id} size={len(raw_message)}"
-                )
-                
-            except RuntimeError as e:
-                # Fallback to manual template ID detection for unsupported message types
-                message_template_id = self.sbe_decoder.get_message_type(raw_message)
-                logger.debug(f"Unsupported SBE template ID {message_template_id}: {e}")
-                return None
-            
+                    message_type = SBEMessageType.TRADE
+            if not message_type:
+                message_type = SBEMessageType.TRADE
+
+            normalized_data = self._normalize_decoded_data(decoded, message_type)
+
+            return SBEMessage(
+                message_type=message_type,
+                symbol=normalized_data.get('symbol', 'BTCUSDT'),
+                event_time=normalized_data.get('event_ts', int(time.time() * 1000)),
+                data=normalized_data,
+                raw_message=f"SBE template={header[1] if header else 'unknown'} size={len(raw_message)}"
+            )
+
         except Exception as e:
             logger.error(f"SBE binary decoding failed: {e}")
             return None
-    
+
+    def _normalize_decoded_data(self, decoded: Dict[str, Any], message_type: SBEMessageType) -> Dict[str, Any]:
+        """Normalize decoder output to match internal expectations."""
+        normalized = {**decoded}
+
+        # Ensure consistent source and msg_type casing
+        normalized['source'] = 'sbe'
+        normalized['msg_type'] = message_type.value
+
+        # Normalize symbol casing if present
+        symbol = normalized.get('symbol')
+        if isinstance(symbol, str):
+            normalized['symbol'] = symbol.upper()
+
+        # Force millisecond timestamps
+        for ts_field in ('event_ts', 'ingest_ts'):
+            if ts_field in normalized and normalized[ts_field] is not None:
+                normalized[ts_field] = int(normalized[ts_field])
+
+        if message_type == SBEMessageType.DEPTH:
+            normalized['bids'] = self._convert_depth_levels(normalized.get('bids'))
+            normalized['asks'] = self._convert_depth_levels(normalized.get('asks'))
+        
+        return normalized
+
+    def _convert_depth_levels(self, levels: Optional[Any]) -> list:
+        """Convert depth levels to [[price, qty], ...] string pairs."""
+        if not levels:
+            return []
+
+        normalized_levels = []
+        for level in levels:
+            price = None
+            qty = None
+
+            if isinstance(level, dict):
+                price = level.get('price')
+                qty = level.get('qty')
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, qty = level[0], level[1]
+
+            if price is None or qty is None:
+                continue
+
+            normalized_levels.append([
+                self._format_numeric(price),
+                self._format_numeric(qty)
+            ])
+
+        return normalized_levels
+
+    def _format_numeric(self, value: Any) -> str:
+        """Format numeric values as compact strings for Avro payloads."""
+        if value is None:
+            return "0"
+
+        if isinstance(value, bool):
+            return "1" if value else "0"
+
+        if isinstance(value, (int, float)):
+            return format(value, '.16g')
+
+        return str(value)
+
     def _build_stream_list(self) -> str:
         """Build stream list for SBE WebSocket subscription."""
         streams = []

@@ -41,9 +41,10 @@ struct MessageHeader {
 
 // Template IDs observed for Binance SBE WebSocket streams (schema 1:0)
 enum class TemplateIdV1 : uint16_t {
-    TRADES_STREAM_EVENT = 10000,           // <symbol>@trade
-    BEST_BID_ASK_STREAM_EVENT = 10001,     // <symbol>@bestBidAsk
-    DEPTH_DIFF_STREAM_EVENT = 10002        // <symbol>@depth
+    TRADES_STREAM_EVENT = 10000,            // <symbol>@trade
+    BEST_BID_ASK_STREAM_EVENT = 10001,      // <symbol>@bestBidAsk
+    DEPTH_DIFF_STREAM_EVENT = 10002,        // <symbol>@depth
+    DEPTH_DIFF_STREAM_EVENT_V2 = 10003      // <symbol>@depth (newer schema variant)
 };
 
 struct HeaderLocation {
@@ -60,7 +61,9 @@ static bool isBestBidAskTemplate(uint16_t templateId) {
 }
 
 static bool isDepthDiffTemplate(uint16_t templateId) {
-    return templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT) || templateId == 103;
+    return templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT) ||
+           templateId == static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT_V2) ||
+           templateId == 103;
 }
 
 
@@ -383,6 +386,7 @@ PYBIND11_MODULE(sbe_decoder_cpp, m) {
     m.attr("TRADES_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::TRADES_STREAM_EVENT);
     m.attr("BEST_BID_ASK_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::BEST_BID_ASK_STREAM_EVENT);
     m.attr("DEPTH_DIFF_STREAM_EVENT") = static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT);
+    m.attr("DEPTH_DIFF_STREAM_EVENT_V2") = static_cast<uint16_t>(TemplateIdV1::DEPTH_DIFF_STREAM_EVENT_V2);
     
     // Export schema constants
     m.attr("EXPECTED_SCHEMA_ID") = BINANCE_SBE_SCHEMA_ID;
