@@ -80,14 +80,14 @@ static std::optional<HeaderLocation> locateSbeHeader(const char* buffer, size_t 
         MessageHeader candidate{};
         std::memcpy(&candidate, buffer + offset, sizeof(MessageHeader));
 
+        // Only validate schema ID and version - accept any template ID for now
         if (candidate.schemaId != BINANCE_SBE_SCHEMA_ID || candidate.version != BINANCE_SBE_SCHEMA_VERSION) {
             continue;
         }
 
-        if (!isKnownTemplate(candidate.templateId)) {
-            continue;
-        }
-
+        // Remove strict template validation - accept any template ID
+        // This allows us to handle unknown template IDs gracefully
+        
         size_t minimumSize = offset + sizeof(MessageHeader);
         if (minimumSize > size) {
             continue;
@@ -168,11 +168,11 @@ private:
         return std::string(symbolBuffer, length);
     }
     
-    // Validate SBE message header
+    // Validate SBE message header (relaxed validation)
     bool validateHeader(const MessageHeader& header) {
+        // Only validate schema ID and version, accept any template ID
         return header.schemaId == EXPECTED_SCHEMA_ID && 
-               header.version == EXPECTED_SCHEMA_VERSION &&
-               isKnownTemplate(header.templateId);
+               header.version == EXPECTED_SCHEMA_VERSION;
     }
     
     // Get current timestamp in milliseconds

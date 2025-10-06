@@ -226,7 +226,8 @@ class BinanceSBEClient:
             
             # Validate message format first
             if not self.sbe_decoder.is_valid_message(raw_message):
-                logger.warning("Invalid SBE message format or schema version")
+                logger.warning(f"Invalid SBE message format or schema version. Expected schema {EXPECTED_SCHEMA_ID}:{EXPECTED_SCHEMA_VERSION}")
+                logger.warning(f"Received: schemaId={header[2]}, version={header[3]}, templateId={header[1]}")
                 return None
             
             # TEMPORARY: Use header-only parsing until proper SBE schema is implemented
@@ -235,6 +236,16 @@ class BinanceSBEClient:
                 header = struct.unpack('<HHHH', raw_message[:8])
                 template_id = header[1]
                 
+                # Map template IDs to message types (flexible mapping)
+                template_to_type = {
+                    10000: ('trade', SBEMessageType.TRADE),
+                    10001: ('bookTicker', SBEMessageType.BEST_BID_ASK), 
+                    10002: ('depth', SBEMessageType.DEPTH),
+                    # Add more template IDs as we discover them
+                }
+                
+                msg_type_str, message_type = template_to_type.get(template_id, ('unknown', None))
+                
                 # Create minimal decoded data from header info
                 decoded_data = {
                     'template_id': template_id,
@@ -242,17 +253,17 @@ class BinanceSBEClient:
                     'version': header[3],
                     'block_length': header[0],
                     'source': 'sbe',
-                    'msg_type': 'trade' if template_id == 10000 else 'unknown',
+                    'msg_type': msg_type_str,
                     'symbol': 'BTCUSDT',  # Hardcoded for now since we know the stream
                     'event_ts': int(time.time() * 1000000),  # Current time in microseconds
                     'ingest_ts': int(time.time() * 1000000),
                     'raw_size': len(raw_message)
                 }
                 
-                message_type = SBEMessageType.TRADE if template_id == 10000 else None
                 if not message_type:
-                    logger.debug(f"Unsupported template ID: {template_id}")
-                    return None
+                    logger.info(f"📋 Discovered new template ID: {template_id} - add to mapping if needed")
+                    # Return a generic message for unknown templates
+                    message_type = SBEMessageType.TRADE  # Fallback to trade type
                 
                 return SBEMessage(
                     message_type=message_type,
