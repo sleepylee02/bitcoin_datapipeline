@@ -264,6 +264,13 @@ class DataFormatValidator:
                 if collected_samples['trade'] is None:
                     collected_samples['trade'] = message.data
                     logger.info(f"📈 Collected trade sample: price={message.data.get('price')}")
+                    logger.info(f"🔍 Trade debug: price_exp={message.data.get('price_exponent')}, qty_exp={message.data.get('qty_exponent')}")
+                    logger.info(f"🔍 Trade debug: offset_fixed_end={message.data.get('debug_offset_fixed_end')}, data_size={message.data.get('debug_data_size')}")
+                    logger.info(f"🔍 Trade debug: next_16_bytes={message.data.get('debug_next_16_bytes')}")
+                    logger.info(f"🔍 Trade debug: marker_at_offset={message.data.get('debug_marker_at_offset')}, found_group={message.data.get('debug_found_group')}")
+                    logger.info(f"🔍 Trade debug: group_block_length={message.data.get('debug_group_block_length')}, num_in_group={message.data.get('debug_num_in_group')}")
+                    logger.info(f"🔍 Trade debug: price_mantissa={message.data.get('debug_price_mantissa')}, qty_mantissa={message.data.get('debug_qty_mantissa')}")
+                    logger.info(f"🔍 Trade debug: trade_id={message.data.get('trade_id')}")
             
             async def collect_bba(message):
                 if collected_samples['bba'] is None:
