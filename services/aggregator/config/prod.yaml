@@ -1,0 +1,39 @@
+# Production configuration for aggregator
+# Uses AWS Kinesis and ElastiCache Redis
+
+aws:
+  region: "${AWS_REGION:us-east-1}"
+  # endpoint_url not set for production
+
+kinesis:
+  streams:
+    trade: "${KINESIS_TRADE_STREAM:bitcoin-market-trade-stream}"
+    bestbidask: "${KINESIS_BESTBIDASK_STREAM:bitcoin-market-bestbidask-stream}"
+    depth: "${KINESIS_DEPTH_STREAM:bitcoin-market-depth-stream}"
+  polling_interval_seconds: ${KINESIS_POLLING_INTERVAL:0.5}
+  max_records_per_request: ${KINESIS_MAX_RECORDS:500}
+
+redis:
+  host: "${REDIS_HOST}"
+  port: ${REDIS_PORT:6379}
+  password: "${REDIS_PASSWORD:}"
+  db: ${REDIS_DB:0}
+  key_prefix: "${REDIS_KEY_PREFIX:features}"
+  ttl_seconds: ${REDIS_TTL:300}  # 5 minutes TTL for production
+  socket_timeout: 10
+  socket_connect_timeout: 10
+
+aggregation:
+  min_messages: ${AGGREGATION_MIN_MESSAGES:50}
+  max_interval_seconds: ${AGGREGATION_MAX_INTERVAL:10}
+  check_interval_seconds: ${AGGREGATION_CHECK_INTERVAL:2.0}
+
+logging:
+  level: "${LOG_LEVEL:INFO}"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]  # CloudWatch handles file logging
+
+health:
+  enabled: true
+  port: 8083
+  host: "0.0.0.0"

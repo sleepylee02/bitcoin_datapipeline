@@ -4,48 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a real-time Bitcoin trading data pipeline that ingests market data from Binance, processes it through stream processing, and runs ML inference for trading signals. The system is designed for low-latency (<100ms p95) real-time predictions with robust fallback mechanisms for handling stale or missing data.
+This is a real-time Bitcoin price prediction service that ingests market data from Binance and provides price predictions every 1-2 seconds using a simple MLP model. The system is designed for low-latency (<100ms) real-time inference with a focus on simplicity and reliability.
 
 ## Architecture
 
-The pipeline follows this flow:
+The system follows two main data flows:
 
-1. **Ingestor Service**: Consumes Binance WebSocket (real-time) and REST API (historical/backfill)
-   - Normalizes data to Avro/Proto schemas
-   - Emits to Kinesis Data Streams (KDS)
-   - Provides heartbeat monitoring
+### 1. Historical Data Pipeline (Training)
+**REST API → S3 → RDBMS → Model Training**
+- REST client fetches historical data from Binance
+- Raw data stored in S3 bronze layer  
+- Data connector transforms and loads into PostgreSQL
+- Training pipeline uses RDBMS data to train MLP model
 
-2. **Stream Processing (Flink/Kinesis Data Analytics)**:
-   - Computes rolling features: VWAP, volatility, order book imbalance, price momentum
-   - Writes features to Redis with TTL for real-time serving
-   - Splits to S3/Iceberg for data lake storage via Kinesis Firehose
-
-3. **Inference Service (ECS/EKS)**:
-   - Consumes from KDS
-   - Fetches features from Redis with fallback controller:
-     1. Fresh online features (within latency budget)
-     2. Repair stale data with delta corrections
-     3. Impute via EMA/Kalman carry-forward
-     4. Pull microbatch features from S3/Iceberg
-     5. Safe mode (no-trade) if all fail
-   - Runs model inference (ONNX/TensorRT/XGBoost)
-   - Inline risk engine with circuit breakers
-
-4. **Feature Store (Feast)**:
-   - Offline: Iceberg tables on S3
-   - Online: Redis/DynamoDB
-   - Provides point-in-time correct features for training and serving
-
-5. **Training Pipeline**:
-   - Incremental training: every 5 minutes (update head/small learner)
-   - Full retrain: every 6-24 hours (rebuild base model)
-   - Model registry: SageMaker/MLflow with shadow → canary → full deployment
-
-6. **Orchestration**:
-   - Airflow (MWAA): batch ETL, retrain, quality checks
-   - EventBridge: triggers for incremental updates
-   - Step Functions: model deployment workflows
-   - CloudWatch/Prometheus: metrics and monitoring
+### 2. Real-time Inference Pipeline  
+**SBE WebSocket → Kinesis → Aggregation → Redis → Inference**
+- SBE client streams real-time market data
+- Kinesis Data Streams for reliable message delivery
+- Aggregation service computes features every N records
+- Redis stores latest features with TTL
+- Inference service predicts price every 1-2 seconds
 
 ## Data Schemas
 
@@ -53,7 +31,7 @@ The pipeline follows this flow:
 ```json
 {
   "symbol": "string",
-  "timestamp": "long",
+  "timestamp": "long", 
   "price": "double",
   "volume": "double",
   "bid_price": "double",
@@ -62,127 +40,118 @@ The pipeline follows this flow:
 }
 ```
 
-### Model Input
-```python
-@dataclass
-class ModelInput:
-    symbol: str
-    timestamp: int
-    price: float
-    vwap: float
-    volatility: float
-    imbalance: float
-    momentum: Dict[str, float]
-```
-
 ### Prediction Output
 ```python
 @dataclass
 class Prediction:
     symbol: str
     timestamp: int
-    signal: float  # -1 to 1
-    confidence: float  # 0 to 1
-    risk_score: float
-    should_trade: bool
+    predicted_price: float
+    confidence: float
+    latency_ms: int
 ```
 
 ## Redis Feature Schema
 ```
-Key: "features:{symbol}:{window}"
-Value: JSON with TTL of 300s
+Key: "features:{symbol}:{timestamp}"
+Value: JSON with TTL of 60s
 {
-  "vwap": 45230.50,
-  "volatility": 0.023,
-  "imbalance": 0.15,
-  "timestamp": 1638360000,
-  "ttl": 300
+  "price": 45230.50,
+  "volume": 123.45,
+  "vwap": 45225.30,
+  "price_change": 0.02,
+  "timestamp": 1638360000
 }
+```
+
+## Service Architecture
+
+```
+services/
+├── ingestor/          # REST + SBE data ingestion
+├── aggregator/        # Kinesis → Redis feature aggregation  
+├── inference/         # MLP price prediction service
+├── trainer/           # Model training pipeline
+└── data-connector/    # S3 → PostgreSQL ETL
 ```
 
 ## Configuration
 
-Environment-specific configs are in `config/`:
+Environment-specific configs are in each service's `config/` directory:
 - `local.yaml`: Local development with Docker Compose
 - `dev.yaml`: Development environment
 - `prod.yaml`: Production settings
 
-Secrets management:
-- Local: `.env` files
-- Production: AWS Secrets Manager
+## Critical Requirements
 
-## Critical Latency Requirements
-
-- **p95 inference latency**: <100ms
-- **Feature freshness**: <60s (triggers staleness alerts)
-- **Heartbeat interval**: 30s
+- **Inference latency**: <100ms per prediction
+- **Prediction frequency**: Every 1-2 seconds
+- **Feature freshness**: <5s (triggers fallback)
+- **Service availability**: 99.9% uptime
 
 ## Development Setup
 
 ### Local Infrastructure (Docker Compose)
-The local environment includes:
-- Kinesis (LocalStack)
+```yaml
+# docker-compose.yml includes:
+- LocalStack (S3, Kinesis)
 - Redis
-- Flink JobManager/TaskManager
-- S3 (LocalStack)
+- PostgreSQL
+- Prometheus/Grafana
+```
 
-### Testing Strategy
+### Running Locally
+```bash
+# Start infrastructure
+docker-compose up -d
 
-**Unit Tests**:
-- Schema validation and serialization
-- Feature computation logic
-- Model inference
-- Fallback controller logic
+# Run services
+cd services/ingestor && python src/main.py
+cd services/aggregator && python src/main.py  
+cd services/inference && python src/main.py
+```
 
-**Integration Tests**:
-- End-to-end data flow
-- Binance API mocking
-- Redis feature serving
-- Model registry integration
-- Local Kinesis with LocalStack
+## Deployment
 
-**Performance Tests**:
-- Latency benchmarks (ensure p95 <100ms)
-- Throughput testing
-- Memory/CPU profiling
-- Backpressure handling
+### Dockerization
+Each service includes:
+- `Dockerfile` for containerization
+- Health check endpoints
+- Graceful shutdown handling
+- Resource limits
 
-## Monitoring & Alerts
+### AWS Deployment
+- **EC2 instances** for service hosting
+- **Kinesis Data Streams** for messaging
+- **ElastiCache Redis** for feature store
+- **RDS PostgreSQL** for training data
+- **S3** for raw data storage
 
-### Business Metrics
-- Prediction accuracy
-- Trade P&L
-- Feature freshness
-- Model drift
+## Monitoring
 
-### Technical Metrics
-- Latency (p50, p95, p99)
-- Throughput
-- Error rates
-- Resource utilization
+### Key Metrics
+- **Latency**: End-to-end prediction time
+- **Throughput**: Predictions per second
+- **Accuracy**: Model prediction quality
+- **Availability**: Service uptime
 
-### Alert Rules
-- Feature staleness >60s → Slack alert
-- Inference latency p95 >100ms → PagerDuty
-- WebSocket disconnection → Trigger fallback mechanism
+### Health Checks
+- `/health` endpoint for each service
+- Redis connectivity
+- Database connectivity
+- Model loading status
 
-## Key Implementation Notes
+## Development Guidelines
 
-### WebSocket Disconnection Handling
-When WebSocket disconnects, use the FallbackController to maintain service:
-1. Use last-known-good values from Redis
-2. Apply delta corrections for slight staleness
-3. Use EMA/Kalman filtering for imputation
-4. Pull microbatch from S3/Iceberg as last resort
-5. Enter safe mode (no-trade) if all fail
+- **Simplicity first**: Focus on core functionality over complex features
+- **Real-time focused**: Optimize for low-latency prediction pipeline
+- **Modular services**: Each service has single responsibility
+- **AWS native**: Use managed AWS services where possible
+- **Monitoring**: Include health checks and metrics in all services
 
-### Incremental vs Full Training
-- **Incremental**: Update model head every 5 minutes with recent data
-- **Full retrain**: Rebuild entire model every 6-24 hours
-- Always validate on point-in-time correct features from Feast
+## Important Reminders
 
-### Model Deployment
-Follow safe deployment pattern:
-1. Shadow mode (log predictions, no action)
-2. Canary deployment (1-5% traffic)
-3. Full rollout (monitor for drift/degradation)
+- Focus on the real-time prediction pipeline
+- Keep services lightweight and focused  
+- Prefer existing AWS services over custom solutions
+- Test locally with Docker Compose before AWS deployment

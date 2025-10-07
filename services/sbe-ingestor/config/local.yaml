@@ -1,0 +1,41 @@
+# Local development configuration for SBE ingestor
+# Uses LocalStack for Kinesis simulation
+
+binance:
+  sbe_base_url: "wss://stream-sbe.binance.com:9443"
+  api_key: "${BINANCE_API_KEY:dummy_key}"
+  api_secret: "${BINANCE_API_SECRET:dummy_secret}"
+  symbols: ["BTCUSDT"]
+  stream_types: ["trade", "bestBidAsk", "depth"]
+  reconnect_interval_seconds: 5
+  heartbeat_interval_seconds: 30
+
+aws:
+  region: "us-east-1"
+  endpoint_url: "http://localhost:4566"  # LocalStack
+
+kinesis:
+  streams:
+    trade: "market-trade-stream"
+    bestbidask: "market-bestbidask-stream"
+    depth: "market-depth-stream"
+  batch_size: 100
+  flush_interval_seconds: 1
+  max_retries: 3
+
+retry:
+  max_attempts: 5
+  initial_backoff_seconds: 1.0
+  max_backoff_seconds: 60.0
+  backoff_multiplier: 2.0
+  jitter: true
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console", "file"]
+
+health:
+  enabled: true
+  port: 8081
+  host: "0.0.0.0"

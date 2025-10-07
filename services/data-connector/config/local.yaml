@@ -1,0 +1,33 @@
+# Local development configuration for data connector
+# Uses LocalStack S3 and local PostgreSQL
+
+aws:
+  region: "us-east-1"
+  s3_bucket: "bitcoin-data-lake"
+  s3_bronze_prefix: "bronze"
+  endpoint_url: "http://localhost:4566"  # LocalStack
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "password"
+  name: "bitcoin_data"
+  pool_min_size: 2
+  pool_max_size: 10
+
+etl:
+  cycle_interval_seconds: 300  # 5 minutes
+  batch_size: 100
+  enable_derived_features: true
+  max_file_age_hours: 72  # Process files up to 3 days old
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console", "file"]
+
+health:
+  enabled: true
+  port: 8082
+  host: "0.0.0.0"

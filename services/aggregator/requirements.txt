@@ -1,0 +1,28 @@
+# Aggregator Service Requirements
+
+# Core dependencies
+asyncio-dgram>=1.0.0
+boto3>=1.26.0
+PyYAML>=6.0
+python-dateutil>=2.8.0
+
+# Redis
+redis>=4.5.0
+
+# Data processing
+numpy>=1.24.0
+
+# HTTP server for health checks
+aiohttp>=3.8.0
+
+# Logging and monitoring
+structlog>=22.0.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.10.0
+black>=22.0.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.0.0
