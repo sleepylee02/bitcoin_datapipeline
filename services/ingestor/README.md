@@ -1,371 +1,596 @@
-# Bitcoin Ingestor Service
+# Bitcoin Ingestor Service - Dual Mode Architecture
 
-A high-performance, AWS-native service for ingesting Bitcoin market data from Binance, designed for real-time trading pipelines.
+## Overview
 
-## Features
+The Bitcoin Ingestor Service implements a **dual-mode architecture** for the 10-second ahead Bitcoin price prediction pipeline. It operates two synchronized modes: **SBE streaming** for the hot path and **REST polling** for reliability and gap prevention, ensuring **zero-downtime** operation with **atomic re-anchoring**.
 
-- **Dual Mode Operation**: REST API backfill and real-time SBE WebSocket streaming
-- **AWS Native**: Built for Kinesis Data Streams, S3, and CloudWatch
-- **Fault Tolerant**: Circuit breakers, exponential backoff, auto-reconnection
-- **Monitoring**: Health checks, Prometheus metrics, CloudWatch integration
-- **Deduplication**: Prevents duplicate data ingestion
-- **Resumable**: REST backfill can resume from checkpoints
+## Architecture Philosophy
 
-## Architecture
+- **Hot Path**: SBE WebSocket → Kinesis → Redis (real-time inference, <100ms)
+- **Reliability Path**: REST API → Gap Detection → Atomic Re-anchor → S3 Backfill
+- **Zero Compromise**: Hot path never waits for REST operations
+- **Atomic Recovery**: Re-anchoring uses key swapping, never clears Redis
+
+## Dual-Mode Operation
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│ Binance API     │    │ Bitcoin Ingestor │    │ AWS Services    │
-│                 │    │                  │    │                 │
-│ • REST API      │───▶│ • REST Client    │───▶│ • S3 (Bronze)   │
-│ • SBE WebSocket │    │ • SBE Client     │    │ • Kinesis       │
-│ • Rate Limits   │    │ • Deduplication  │    │ • CloudWatch    │
-└─────────────────┘    │ • Health Checks  │    └─────────────────┘
-                       └──────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       SBE MODE (Hot Path)                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Binance SBE ──► C++ Decoder ──► Kinesis ──► Lambda ──► Redis   │
+│  WebSocket    │  (<1ms)       │ Streams   │ /KDA   │ Hot State  │
+│               │               │           │        │            │
+│               ▼               ▼           ▼        ▼            │
+│         ┌──────────┐    ┌──────────┐ ┌──────────┐ ┌──────────┐ │
+│         │Trades    │    │market-   │ │Real-time │ │Order Book│ │
+│         │Depth     │    │sbe-*     │ │Processing│ │Trade Stats│ │
+│         │BestBidAsk│    │streams   │ │          │ │Features  │ │
+│         └──────────┘    └──────────┘ └──────────┘ └──────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+┌─────────────────────────────────────────────────────────────────┐
+│                    REST MODE (Reliability Path)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                   │                             │
+│  EventBridge ──► REST Poller ──► Gap Detection ──► Re-anchor    │
+│  (1-min)      │                │               │               │
+│               │                │               │               │
+│               ▼                ▼               ▼               │
+│         ┌──────────┐     ┌──────────┐    ┌──────────┐         │
+│         │/depth    │     │Sequence  │    │Atomic    │         │
+│         │/aggTrades│     │Monitor   │    │Redis Swap│         │
+│         │/klines   │     │          │    │          │         │
+│         └──────────┘     └──────────┘    └──────────┘         │
+│               │                │               │               │
+│               ▼                ▼               ▼               │
+│         ┌──────────┐     ┌──────────┐    ┌──────────┐         │
+│         │S3 Bronze │     │Alert     │    │Resume SBE│         │
+│         │Backfill  │     │System    │    │Processing│         │
+│         └──────────┘     └──────────┘    └──────────┘         │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
 
+### Prerequisites
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Build SBE decoder (required for SBE mode)
+chmod +x build_sbe_decoder.sh
+./build_sbe_decoder.sh
+
+# Set environment variables
+export BINANCE_API_KEY="your_binance_api_key"
+export BINANCE_API_SECRET="your_binance_api_secret"
+```
+
 ### Local Development with Docker Compose
 
-1. **Start LocalStack**:
+1. **Start Infrastructure**:
 ```bash
+cd ../../  # Project root
 docker-compose up localstack redis -d
 ```
 
-2. **Install Dependencies**:
+2. **Run SBE Mode (Hot Path)**:
 ```bash
-pip install -r requirements-dev.txt
+CONFIG_FILE=config/local.yaml MODE=sbe python src/main.py
 ```
 
-3. **Run Service**:
+3. **Run REST Mode (Reliability Path)** (separate terminal):
 ```bash
-CONFIG_FILE=config/local.yaml python src/main.py
+CONFIG_FILE=config/local.yaml MODE=rest python src/main.py
 ```
 
 4. **Check Health**:
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8080/health  # SBE service
+curl http://localhost:8081/health  # REST service
 ```
 
-### Docker Build and Run
+### Production Deployment
 
 ```bash
-# Build image (includes C++ SBE decoder compilation)
+# Build and deploy both modes
 docker build -t bitcoin-ingestor .
 
-# Run container with SBE mode
-docker run -p 8080:8080 -p 8081:8081 \
-  -e CONFIG_FILE=config/local.yaml \
-  -e BINANCE_API_KEY=your_api_key \
+# SBE mode (hot path)
+docker run -d --name ingestor-sbe \
+  -p 8080:8080 \
+  -e CONFIG_FILE=config/prod.yaml \
+  -e MODE=sbe \
+  -e BINANCE_API_KEY=${BINANCE_API_KEY} \
+  bitcoin-ingestor
+
+# REST mode (reliability path)  
+docker run -d --name ingestor-rest \
+  -p 8081:8081 \
+  -e CONFIG_FILE=config/prod.yaml \
+  -e MODE=rest \
+  -e BINANCE_API_KEY=${BINANCE_API_KEY} \
   bitcoin-ingestor
 ```
 
 ## Configuration
 
-The service supports environment-specific configuration files:
-
-- `config/local.yaml` - Local development with LocalStack
-- `config/dev.yaml` - Development environment
-- `config/prod.yaml` - Production configuration
-
-### Setup Configuration
-
-The YAML configuration files use environment variable substitution for secrets. This follows industry best practices for production deployments.
-
-**Required Environment Variables:**
-```bash
-# Binance API credentials (required for SBE mode)
-export BINANCE_API_KEY="your_binance_api_key"
-export BINANCE_API_SECRET="your_binance_api_secret"
-
-# AWS credentials (use IAM roles in production, env vars for local/dev)
-export AWS_ACCESS_KEY_ID="your_aws_access_key"
-export AWS_SECRET_ACCESS_KEY="your_aws_secret_key"
-```
-
-**Quick Setup:**
-1. Set environment variables (see above)
-2. Choose config file: `CONFIG_FILE=config/local.yaml`
-3. Run service: `python src/main.py`
-
-**For Local Development:**
-```bash
-# LocalStack uses default credentials
-export AWS_ACCESS_KEY_ID="localstack"
-export AWS_SECRET_ACCESS_KEY="localstack"
-export BINANCE_API_KEY="your_binance_key"
-export BINANCE_API_SECRET="your_binance_secret"
-
-CONFIG_FILE=config/local.yaml python src/main.py
-```
-
-**Environment File (Optional):**
-Create `.env` file for convenience (not tracked in git):
-```bash
-# .env
-BINANCE_API_KEY=your_binance_api_key
-BINANCE_API_SECRET=your_binance_api_secret
-AWS_ACCESS_KEY_ID=your_aws_access_key
-AWS_SECRET_ACCESS_KEY=your_aws_secret_key
-```
-
-Load with: `source .env` or use python-dotenv
-
-### Key Settings
-
+### SBE Mode Configuration (`config/sbe.yaml`)
 ```yaml
-# Service mode
-mode: "sbe"  # Options: rest, sbe, both
+service_name: "bitcoin-ingestor-sbe"
+mode: "sbe"
 
-# Binance configuration
 binance:
+  sbe_ws_url: "wss://stream-sbe.binance.com:9443"
+  api_key: "${BINANCE_API_KEY}"
+  symbols: ["BTCUSDT"]
+  stream_types: ["trade", "bestBidAsk", "depth"]
+  reconnect_interval_seconds: 5
+
+aws:
+  region: "us-east-1"
+  kinesis:
+    streams:
+      trade: "market-sbe-trade"
+      bestbidask: "market-sbe-bestbidask"  
+      depth: "market-sbe-depth"
+    batch_size: 500
+    flush_interval_seconds: 1
+
+health:
+  port: 8080
+  host: "0.0.0.0"
+
+metrics:
+  enable_prometheus: true
+  prometheus_port: 9090
+```
+
+### REST Mode Configuration (`config/rest.yaml`)
+```yaml
+service_name: "bitcoin-ingestor-rest"
+mode: "rest"
+
+binance:
+  rest_base_url: "https://data-api.binance.vision"
   symbols: ["BTCUSDT"]
   rate_limit_requests_per_minute: 1200
 
-# AWS configuration
 aws:
   region: "us-east-1"
-  kinesis_trade_stream: "market-sbe-trade"
-  s3_bucket: "bitcoin-data-lake"
-  localstack_endpoint: "http://localhost:4566"  # For local dev
+  s3:
+    bucket: "bitcoin-data-lake"
+    bronze_prefix: "bronze"
+
+scheduler:
+  poll_interval_seconds: 60  # Every 1 minute
+  gap_detection_enabled: true
+  reanchor_enabled: true
+
+health:
+  port: 8081
+  host: "0.0.0.0"
 ```
 
-## Operation Modes
+## SBE Mode (Hot Path)
 
-### SBE Mode (Real-time Streaming)
-- Connects to Binance SBE WebSocket (wss://stream-sbe.binance.com:9443)
-- Uses C++ decoder for high-performance binary parsing
-- Processes `trade`, `bestBidAsk`, and `depth` messages
-- Publishes to Kinesis Data Streams
-- Sub-millisecond parsing latency
-- Requires Binance API key authentication
+### Purpose
+- **Real-time streaming** for sub-100ms inference pipeline
+- **Direct Redis updates** via Kinesis Lambda processors
+- **Zero latency compromise** for prediction accuracy
 
-### REST Mode (Historical Backfill)
-- Fetches historical data via REST API
-- Supports `aggTrades`, `trades`, `klines`
-- Writes to S3 Bronze layer
-- Resumable with checkpoints
+### Key Features
+- **C++ SBE Decoder**: Sub-millisecond binary message parsing
+- **Kinesis Integration**: Reliable message delivery with Lambda/KDA processing
+- **Redis Hot State**: Direct order book and trade statistics updates
+- **Sequence Monitoring**: Gap detection for reliability triggers
 
-### Both Mode
-- Runs REST and SBE simultaneously
-- Useful for initial backfill + live streaming
+### Data Flow
+```
+SBE WebSocket → C++ Decoder → Kinesis Streams → Lambda/KDA → Redis
+     ↓              ↓             ↓              ↓         ↓
+Trade Events    Binary→JSON   Reliable      Real-time   Hot State
+Depth Updates   <1ms parse    Delivery      Processing  Updates
+BestBidAsk      Type-safe     Partitioned   Features    ob:BTCUSDT
+                Schema        Auto-scale    Compute     tr:BTCUSDT:*
+```
 
-## Data Schemas
+### Performance Targets
+- **Parse Latency**: <1ms per SBE message
+- **End-to-end**: SBE → Redis <50ms (P95)
+- **Throughput**: 5,000+ messages/second
+- **Availability**: 99.95% uptime (excluding planned maintenance)
 
-### Trade Data (Avro)
+### SBE Message Types
+
+#### Trade Events (`trade`)
 ```json
 {
   "symbol": "BTCUSDT",
-  "event_ts": 1640995200000,
-  "ingest_ts": 1640995200100,
-  "trade_id": 12345,
-  "price": 45000.50,
-  "qty": 0.1,
+  "event_ts": 1638360000123456,  // Microsecond precision
+  "trade_id": 123456789,
+  "price": 45230.50,
+  "quantity": 0.1567,
   "is_buyer_maker": false,
+  "sequence_id": 987654321,      // For gap detection
   "source": "sbe"
 }
 ```
 
-### Best Bid/Ask (Avro)
+#### Best Bid/Ask (`bestBidAsk`)
+```json
+{
+  "symbol": "BTCUSDT", 
+  "event_ts": 1638360000123456,
+  "bid_price": 45229.50,
+  "bid_quantity": 1.234,
+  "ask_price": 45231.00,
+  "ask_quantity": 0.987,
+  "sequence_id": 987654322,
+  "source": "sbe"
+}
+```
+
+#### Depth Updates (`depth`)
 ```json
 {
   "symbol": "BTCUSDT",
-  "event_ts": 1640995200000,
-  "ingest_ts": 1640995200100,
-  "bid_px": 44999.99,
-  "bid_sz": 0.5,
-  "ask_px": 45000.01,
-  "ask_sz": 0.3,
+  "event_ts": 1638360000123456,
+  "first_update_id": 123450000,
+  "final_update_id": 123450010,
+  "bids": [["45229.50", "1.234"], ["45229.00", "2.567"]],
+  "asks": [["45231.00", "0.987"], ["45231.50", "1.876"]],
   "source": "sbe"
 }
 ```
 
-## Monitoring
+## REST Mode (Reliability Path)
 
-### Health Endpoints
+### Purpose
+- **Gap detection** in SBE stream via sequence monitoring
+- **Atomic re-anchoring** to recover Redis state without downtime
+- **S3 backfill** for historical analysis and training
+- **Validation** of SBE data consistency
 
-- `GET /health` - Basic health check
-- `GET /health/detailed` - Detailed component status
-- `GET /health/components/{component}` - Component-specific health
-- `GET /stats` - Service statistics
+### Key Features
+- **EventBridge Scheduling**: 1-minute polling for consistency
+- **Gap Detection**: Multi-criteria validation (sequence, time, volume)
+- **Atomic Re-anchor**: Redis key swapping without clearing state
+- **S3 Bronze Layer**: Historical data for training pipeline
 
-### Prometheus Metrics
+### Data Flow
+```
+EventBridge → REST Poller → Gap Detection → Re-anchor Decision
+    ↓             ↓             ↓                ↓
+1-min Timer   /depth        Sequence ID      Atomic Redis
+Schedule      /aggTrades    Validation       Key Swapping
+              /klines       Time Gaps        
+                           Volume Check      Resume SBE
+```
 
-Available on port 8081 (when enabled):
+### REST API Endpoints Used
 
-- `ingestor_messages_total` - Total messages processed
-- `ingestor_errors_total` - Total errors by component
-- `ingestor_kinesis_records_total` - Records sent to Kinesis
-- `ingestor_connection_status` - Connection status by component
+#### Order Book Snapshot (`/api/v3/depth`)
+```bash
+GET /api/v3/depth?symbol=BTCUSDT&limit=100
+```
+Used for: Re-anchoring order book state in Redis
 
-### CloudWatch Metrics
+#### Aggregate Trades (`/api/v3/aggTrades`)
+```bash
+GET /api/v3/aggTrades?symbol=BTCUSDT&fromId=123456&limit=1000
+```
+Used for: Backfilling trade data and gap detection
 
-Automatic emission to CloudWatch (when enabled):
+#### Klines (`/api/v3/klines`)
+```bash
+GET /api/v3/klines?symbol=BTCUSDT&interval=1m&limit=60
+```
+Used for: Validation and S3 bronze layer
 
-- `MessagesProcessed` - Total messages processed
-- `RecordsSentKinesis` - Records sent to Kinesis streams
-- `RecordsWrittenS3` - Records written to S3
-- `SBEConnectionStatus` - WebSocket connection status
+### Gap Detection Algorithm
 
-## SBE C++ Decoder
+```python
+def detect_gap(current_sequence: int, last_sequence: int, 
+               current_time: int, last_time: int) -> bool:
+    # Sequence gap detection
+    sequence_gap = current_sequence - last_sequence > 1
+    
+    # Time gap detection (>5 seconds)
+    time_gap = current_time - last_time > 5_000_000  # microseconds
+    
+    # Volume consistency check
+    volume_inconsistent = check_volume_consistency()
+    
+    return sequence_gap or time_gap or volume_inconsistent
+```
 
-The service includes a high-performance C++ extension for parsing Binance SBE binary messages.
+### Atomic Re-anchoring Procedure
 
-### Building the SBE Decoder
+```python
+async def atomic_reanchor(symbol: str):
+    # 1. Set re-anchor flag (prevents concurrent operations)
+    await redis.set(f'reanchor:{symbol}', '1', ex=300)
+    
+    # 2. Fetch fresh data from REST APIs (parallel)
+    depth_data, trades_data = await asyncio.gather(
+        binance_rest.get_depth(symbol, limit=100),
+        binance_rest.get_recent_trades(symbol, limit=1000)
+    )
+    
+    # 3. Build new state in temporary Redis keys
+    await build_temp_order_book(f'ob:new:{symbol}', depth_data)
+    await build_temp_trade_stats(f'tr:new:{symbol}', trades_data)
+    await build_temp_features(f'feat:new:{symbol}')
+    
+    # 4. Atomic swap (all operations succeed or all fail)
+    pipeline = redis.pipeline()
+    pipeline.rename(f'ob:new:{symbol}', f'ob:{symbol}')
+    pipeline.rename(f'tr:new:{symbol}:1s', f'tr:{symbol}:1s')
+    pipeline.rename(f'tr:new:{symbol}:5s', f'tr:{symbol}:5s')
+    pipeline.rename(f'feat:new:{symbol}', f'feat:{symbol}')
+    pipeline.delete(f'reanchor:{symbol}')
+    await pipeline.execute()  # Atomic operation
+    
+    # 5. Resume SBE processing
+    logger.info(f"Re-anchor completed for {symbol}")
+```
+
+## Health Monitoring
+
+### SBE Mode Health Checks
 
 ```bash
-# Build the C++ extension
+GET /health
+{
+  "status": "healthy",
+  "service": "bitcoin-ingestor-sbe", 
+  "components": {
+    "sbe_websocket": {
+      "status": "connected",
+      "last_message_age_ms": 150,
+      "messages_per_second": 125.5,
+      "reconnect_count": 0
+    },
+    "kinesis_producer": {
+      "status": "healthy",
+      "success_rate": 0.999,
+      "avg_latency_ms": 15,
+      "buffer_size": 45
+    },
+    "sbe_decoder": {
+      "status": "loaded",
+      "decode_errors": 0,
+      "messages_decoded": 1567890,
+      "avg_decode_time_us": 450
+    }
+  }
+}
+```
+
+### REST Mode Health Checks
+
+```bash
+GET /health
+{
+  "status": "healthy",
+  "service": "bitcoin-ingestor-rest",
+  "components": {
+    "binance_rest": {
+      "status": "healthy",
+      "last_call_latency_ms": 85,
+      "rate_limit_remaining": 1150,
+      "error_rate": 0.001
+    },
+    "gap_detector": {
+      "status": "monitoring", 
+      "last_check_time": "2024-01-15T14:30:00Z",
+      "gaps_detected_today": 0,
+      "last_sequence_id": 987654321
+    },
+    "s3_writer": {
+      "status": "healthy",
+      "files_written_today": 24,
+      "avg_write_latency_ms": 120,
+      "write_errors": 0
+    }
+  }
+}
+```
+
+## Performance Metrics
+
+### SBE Mode Metrics
+- `ingestor_sbe_messages_total` - Total SBE messages processed
+- `ingestor_sbe_decode_duration_seconds` - SBE decode latency histogram
+- `ingestor_kinesis_records_sent_total` - Records sent to Kinesis
+- `ingestor_sbe_connection_status` - WebSocket connection status
+- `ingestor_sbe_sequence_gaps_total` - Detected sequence gaps
+
+### REST Mode Metrics  
+- `ingestor_rest_api_calls_total` - REST API calls made
+- `ingestor_rest_gaps_detected_total` - Gaps detected
+- `ingestor_rest_reanchors_total` - Re-anchor operations performed
+- `ingestor_rest_s3_files_written_total` - Files written to S3
+- `ingestor_rest_api_latency_seconds` - REST API latency histogram
+
+## Error Handling
+
+### SBE Mode Error Scenarios
+
+#### WebSocket Disconnection
+```python
+async def handle_websocket_disconnect():
+    logger.warning("SBE WebSocket disconnected")
+    # Attempt reconnection with exponential backoff
+    for attempt in range(MAX_RECONNECT_ATTEMPTS):
+        await asyncio.sleep(2 ** attempt)
+        if await sbe_client.connect():
+            logger.info("SBE reconnection successful")
+            return
+    
+    # If all reconnects fail, alert and degrade gracefully
+    logger.error("SBE reconnection failed, entering degraded mode")
+    await alert_ops_team("SBE_RECONNECTION_FAILED")
+```
+
+#### Kinesis Throttling
+```python
+async def handle_kinesis_throttling():
+    # Exponential backoff with jitter
+    await asyncio.sleep(random.uniform(1, 5))
+    # Reduce batch size temporarily
+    kinesis_producer.reduce_batch_size()
+```
+
+### REST Mode Error Scenarios
+
+#### API Rate Limiting
+```python
+async def handle_rate_limit(retry_after: int):
+    logger.warning(f"Binance rate limit hit, waiting {retry_after}s")
+    await asyncio.sleep(retry_after)
+    # Continue with next scheduled poll
+```
+
+#### Re-anchor Failure
+```python
+async def handle_reanchor_failure(symbol: str, error: Exception):
+    logger.error(f"Re-anchor failed for {symbol}: {error}")
+    # Clean up temporary keys
+    await cleanup_temp_keys(symbol)
+    # Clear re-anchor flag
+    await redis.delete(f'reanchor:{symbol}')
+    # Alert ops team
+    await alert_ops_team("REANCHOR_FAILED", symbol=symbol)
+```
+
+## Development and Testing
+
+### Local Development Setup
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+
+# 2. Build SBE decoder
 ./build_sbe_decoder.sh
 
-# Verify installation
-python -c "from sbe_decoder_cpp import SBEDecoder; print('SBE decoder loaded!')"
+# 3. Start local infrastructure
+docker-compose up localstack redis -d
+
+# 4. Set environment variables
+export BINANCE_API_KEY="your_test_key"
+export AWS_ACCESS_KEY_ID="localstack"
+export AWS_SECRET_ACCESS_KEY="localstack"
+
+# 5. Run tests
+pytest tests/
+
+# 6. Start services
+python src/main.py --mode sbe --config config/local.yaml
+python src/main.py --mode rest --config config/local.yaml
 ```
 
-### Performance Benefits
+### Testing Strategy
 
-- **Sub-millisecond parsing**: C++ binary parsing vs Python JSON parsing
-- **Memory efficient**: Direct binary access without string conversion
-- **Type safety**: Compile-time validation of message structures
-- **Schema validation**: Built-in SBE header and template validation
-
-### Requirements
-
-The SBE client requires:
-- C++ compiler (for building the decoder extension)
-- Binance API key (for SBE stream authentication)
-- Python 3.8+ with pybind11 support
-
-## Development
-
-### Testing
-
+#### Unit Tests
 ```bash
-# Run all tests
-pytest
+# Test SBE decoder
+pytest tests/unit/test_sbe_decoder.py
 
-# Run unit tests only
-pytest tests/unit/
+# Test gap detection algorithm  
+pytest tests/unit/test_gap_detection.py
 
-# Run with coverage
-pytest --cov=src --cov-report=html
-
-# Run specific test
-pytest tests/unit/test_kinesis_client.py::TestKinesisProducer::test_put_record
+# Test atomic re-anchor logic
+pytest tests/unit/test_reanchor.py
 ```
 
-### Code Quality
-
+#### Integration Tests
 ```bash
-# Format code
-black src/ tests/
+# Test SBE → Kinesis → Redis flow
+pytest tests/integration/test_sbe_pipeline.py
 
-# Sort imports
-isort src/ tests/
+# Test REST → S3 → Re-anchor flow
+pytest tests/integration/test_rest_pipeline.py
 
-# Lint
-flake8 src/ tests/
-
-# Type checking
-mypy src/
+# Test full dual-mode operation
+pytest tests/integration/test_dual_mode.py
 ```
 
-### Adding New Features
-
-1. **Update Configuration**: Add new settings to `src/config/settings.py`
-2. **Implement Feature**: Add code with proper error handling and logging
-3. **Add Tests**: Unit tests for logic, integration tests for workflows
-4. **Update Monitoring**: Add relevant metrics and health checks
-5. **Document**: Update this README and add inline documentation
-
-## Deployment
-
-### AWS ECS
-
+#### Performance Tests
 ```bash
-# Build and push to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
-docker build -t bitcoin-ingestor .
-docker tag bitcoin-ingestor:latest <account>.dkr.ecr.us-east-1.amazonaws.com/bitcoin-ingestor:latest
-docker push <account>.dkr.ecr.us-east-1.amazonaws.com/bitcoin-ingestor:latest
+# Test SBE decode performance (<1ms requirement)
+pytest tests/performance/test_sbe_latency.py
 
-# Deploy via ECS task definition
-aws ecs update-service --cluster bitcoin-cluster --service ingestor-service --force-new-deployment
-```
-
-### Environment Variables
-
-```bash
-CONFIG_FILE=/app/config/prod.yaml
-AWS_REGION=us-east-1
-AWS_DEFAULT_REGION=us-east-1
+# Test atomic re-anchor speed (<60s requirement)
+pytest tests/performance/test_reanchor_speed.py
 ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **WebSocket Disconnections**
-   - Check network connectivity
-   - Verify Binance endpoint availability
-   - Review reconnection logs
-
-2. **Kinesis Throttling**
-   - Increase shard count
-   - Reduce batch size
-   - Check circuit breaker status
-
-3. **S3 Write Failures**
-   - Verify IAM permissions
-   - Check bucket policy
-   - Review error logs
-
-4. **High Memory Usage**
-   - Check deduplication cache size
-   - Review batch sizes
-   - Monitor queue depths
-
-### Logs Analysis
-
+#### 1. SBE Decoder Build Failure
 ```bash
-# View structured logs
-docker logs bitcoin-ingestor | jq '.message'
+# Install build dependencies
+sudo apt-get install build-essential cmake python3-dev
 
-# Filter by level
-docker logs bitcoin-ingestor | jq 'select(.level=="ERROR")'
-
-# Monitor health
-watch -n 5 'curl -s http://localhost:8080/health | jq'
+# Clean and rebuild
+rm -rf sbe_decoder/build/
+./build_sbe_decoder.sh
 ```
 
-## Performance Tuning
+#### 2. WebSocket Authentication Failure
+```bash
+# Verify API key has SBE permissions
+curl -H "X-MBX-APIKEY: ${BINANCE_API_KEY}" \
+  "https://api.binance.com/api/v3/account"
 
-### Throughput Optimization
+# Check WebSocket URL and headers
+```
 
-- Increase `kinesis_batch_size` for higher throughput
-- Reduce `kinesis_flush_interval_seconds` for lower latency
-- Tune `rate_limit_requests_per_minute` based on API limits
+#### 3. Redis Connection Issues
+```bash
+# Check Redis connectivity
+redis-cli ping
 
-### Memory Optimization
+# Verify Redis configuration
+redis-cli config get '*'
+```
 
-- Adjust deduplication window size
-- Monitor queue sizes
-- Use compression for S3 writes
+#### 4. Kinesis Throttling
+```bash
+# Check shard count
+aws kinesis describe-stream --stream-name market-sbe-trade
 
-### Latency Optimization
+# Monitor metrics
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/Kinesis \
+  --metric-name IncomingRecords \
+  --start-time 2024-01-15T14:00:00Z \
+  --end-time 2024-01-15T15:00:00Z \
+  --period 300 \
+  --statistics Sum
+```
 
-- Minimize batch sizes
-- Reduce flush intervals
-- Optimize network configuration
+### Debugging Commands
 
-## Contributing
+```bash
+# Monitor SBE messages
+curl -s http://localhost:8080/stats | jq '.sbe_stats'
 
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
+# Check gap detection status
+curl -s http://localhost:8081/stats | jq '.gap_detection'
 
-## License
+# View recent logs
+docker logs bitcoin-ingestor-sbe --tail 100 | jq '.message'
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+# Monitor Redis keys
+redis-cli --scan --pattern "ob:*" | head -10
+redis-cli --scan --pattern "tr:*" | wc -l
+```
+
+This dual-mode architecture ensures **zero-downtime** Bitcoin price prediction with **sub-100ms inference latency** while maintaining **data integrity** through atomic re-anchoring and gap detection.

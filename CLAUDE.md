@@ -4,100 +4,136 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a real-time Bitcoin price prediction service that ingests market data from Binance and provides price predictions every 1-2 seconds using a simple MLP model. The system is designed for low-latency (<100ms) real-time inference with a focus on simplicity and reliability.
+This is a **real-time Bitcoin price prediction service** that predicts Bitcoin price **10 seconds ahead** with predictions generated **every 2 seconds**. The system uses a hot-path architecture with atomic re-anchoring for zero-downtime reliability, achieving sub-100ms inference latency.
 
 ## Architecture
 
-The system follows two main data flows:
+The system implements a **tri-layer architecture** with atomic re-anchoring for reliability:
 
-### 1. Historical Data Pipeline (Training)
-**REST API → S3 → RDBMS → Model Training**
-- REST client fetches historical data from Binance
-- Raw data stored in S3 bronze layer  
-- Data connector transforms and loads into PostgreSQL
-- Training pipeline uses RDBMS data to train MLP model
+### 1. Hot Path (Real-time Inference) 
+**SBE WebSocket → Kinesis → Lambda/KDA → Redis → Inference (every 2s)**
+- SBE client streams trades, order book, and best bid/ask data
+- Kinesis Data Streams with Lambda/KDA processors for low latency
+- Redis stores hot state: order books, rolling trade stats, feature vectors
+- Inference service reads Redis only, predicts 10 seconds ahead every 2 seconds
+- **Critical**: Hot path never waits for REST API or S3 operations
 
-### 2. Real-time Inference Pipeline  
-**SBE WebSocket → Kinesis → Aggregation → Redis → Inference**
-- SBE client streams real-time market data
-- Kinesis Data Streams for reliable message delivery
-- Aggregation service computes features every N records
-- Redis stores latest features with TTL
-- Inference service predicts price every 1-2 seconds
+### 2. Reliability Path (Gap Prevention & Recovery)
+**REST API (1-min) → Gap Detection → Atomic Re-anchor → S3 Backfill**
+- REST client polls every 1 minute for depth snapshots and aggregate trades
+- Sequence monitoring detects gaps in SBE stream
+- Atomic Redis key swapping during re-anchoring (no downtime)
+- S3 bronze layer receives all raw data for historical analysis
+- **Critical**: Recovery operations never block the hot inference path
+
+### 3. Training Pipeline (Model Development)
+**S3 Bronze → Silver → Gold → Model Training → Deployment**
+- S3 bronze: Raw SBE events and REST responses
+- S3 silver: Normalized snapshots and 1-minute bars  
+- S3 gold: Feature vectors (2s intervals) and labels (10s ahead targets)
+- Lightweight MLP training optimized for <100ms inference
+- Model deployment to inference service without hot path interruption
 
 ## Data Schemas
 
-### Market Data (Avro)
-```json
-{
-  "symbol": "string",
-  "timestamp": "long", 
-  "price": "double",
-  "volume": "double",
-  "bid_price": "double",
-  "ask_price": "double",
-  "source": "string"
+### Redis Hot State Schema
+```
+# Order Book (no TTL - always live)
+ob:BTCUSDT (HASH): {
+  "best_bid": 45229.50, "best_ask": 45231.00, "spread": 1.50,
+  "bid1_p": 45229.50, "bid1_q": 1.5, ..., "ask10_p": 45240.00, "ask10_q": 0.8,
+  "ts_us": 1638360000123456
 }
+
+# Rolling Trade Stats (5min TTL)
+tr:BTCUSDT:1s (HASH): {"count": 15, "vol": 12.5, "signed_vol": 2.3, "vwap_minus_mid": 0.05, "last_ts_us": 1638360000}
+tr:BTCUSDT:5s (HASH): {"count": 75, "vol": 65.2, "signed_vol": 8.7, "vwap_minus_mid": 0.12, "last_ts_us": 1638360000}
+
+# Feature Vector (2min TTL)
+feat:BTCUSDT (HASH): {"ret_1s": 0.0002, "ret_5s": 0.0015, "vol_imbalance": 0.03, "spread_bp": 3.3, "ts": 1638360000}
+
+# Re-anchor Flag
+reanchor:BTCUSDT (FLAG): Set during atomic recovery operations
 ```
 
-### Prediction Output
+### Prediction Output Schema
 ```python
 @dataclass
 class Prediction:
-    symbol: str
-    timestamp: int
-    predicted_price: float
-    confidence: float
-    latency_ms: int
+    symbol: str = "BTCUSDT"
+    timestamp: int              # Current time (ms)
+    current_price: float
+    predicted_price_10s: float  # Price 10 seconds ahead
+    confidence: float           # 0.0 - 1.0
+    latency_ms: int            # Inference latency
+    model_version: str
+    features_age_ms: int       # Age of input features
+    source: str                # "redis" or "fallback"
 ```
 
-## Redis Feature Schema
+### S3 Data Lake Schema
 ```
-Key: "features:{symbol}:{timestamp}"
-Value: JSON with TTL of 60s
-{
-  "price": 45230.50,
-  "volume": 123.45,
-  "vwap": 45225.30,
-  "price_change": 0.02,
-  "timestamp": 1638360000
-}
+# Bronze Layer (Raw Events)
+s3://bitcoin-data-lake/bronze/sbe/{symbol}/year={}/month={}/day={}/hour={}/*.parquet
+s3://bitcoin-data-lake/bronze/rest/{symbol}/{data_type}/year={}/month={}/day={}/*.parquet
+
+# Silver Layer (Normalized)  
+s3://bitcoin-data-lake/silver/snapshots/{symbol}/year={}/month={}/day={}/*.parquet
+s3://bitcoin-data-lake/silver/bars_1m/{symbol}/year={}/month={}/day={}/*.parquet
+
+# Gold Layer (ML Ready)
+s3://bitcoin-data-lake/gold/features_2s/{symbol}/year={}/month={}/day={}/*.parquet
+s3://bitcoin-data-lake/gold/labels_10s/{symbol}/year={}/month={}/day={}/*.parquet
 ```
 
 ## Service Architecture
 
 ```
 services/
-├── ingestor/          # REST + SBE data ingestion
-├── aggregator/        # Kinesis → Redis feature aggregation  
-├── inference/         # MLP price prediction service
-├── trainer/           # Model training pipeline
-└── data-connector/    # S3 → PostgreSQL ETL
+├── ingestor/          # Dual-mode: SBE streaming + REST gap detection
+│   ├── sbe-mode/      # Real-time SBE → Kinesis (hot path)
+│   └── rest-mode/     # 1-min polling → gap detection → atomic re-anchor
+├── aggregator/        # Kinesis → Redis state management + atomic operations
+│   ├── redis-writer/  # Order book maintenance, rolling trade stats
+│   └── reanchor/      # Atomic key swapping during recovery
+├── inference/         # Redis-only reads → 10s prediction (every 2s)
+│   ├── feature-reader/# Redis hot state consumption
+│   └── predictor/     # Lightweight MLP inference <100ms
+├── trainer/           # S3 gold → model training → deployment
+│   ├── feature-eng/   # S3 bronze → silver → gold pipeline
+│   └── model-dev/     # MLP training optimized for inference speed
+└── lambda-functions/  # Event-driven processing
+    ├── gap-detector/  # SBE sequence monitoring
+    ├── rest-puller/   # 1-min REST polling and re-anchor trigger
+    └── s3-processor/  # Bronze → silver ETL
 ```
 
 ## Configuration
 
 Environment-specific configs are in each service's `config/` directory:
-- `local.yaml`: Local development with Docker Compose
-- `dev.yaml`: Development environment
-- `prod.yaml`: Production settings
+- `local.yaml`: LocalStack + Redis for development
+- `dev.yaml`: AWS services with reduced scale
+- `prod.yaml`: Production scale with high availability
 
 ## Critical Requirements
 
-- **Inference latency**: <100ms per prediction
-- **Prediction frequency**: Every 1-2 seconds
-- **Feature freshness**: <5s (triggers fallback)
-- **Service availability**: 99.9% uptime
+- **Prediction target**: Bitcoin price 10 seconds ahead
+- **Prediction frequency**: Every 2 seconds
+- **Inference latency**: <100ms per prediction (P99)
+- **Hot path isolation**: Inference never waits for REST/S3 operations
+- **Zero downtime**: Atomic re-anchoring during gap recovery
+- **Feature freshness**: <2s for optimal predictions
+- **Service availability**: 99.9% uptime with graceful degradation
 
 ## Development Setup
 
 ### Local Infrastructure (Docker Compose)
 ```yaml
 # docker-compose.yml includes:
-- LocalStack (S3, Kinesis)
-- Redis
-- PostgreSQL
-- Prometheus/Grafana
+- LocalStack (S3, Kinesis Data Streams)
+- Redis Cluster (hot state storage)
+- Mock SBE stream generator
+- Prometheus/Grafana (monitoring)
 ```
 
 ### Running Locally
@@ -105,53 +141,74 @@ Environment-specific configs are in each service's `config/` directory:
 # Start infrastructure
 docker-compose up -d
 
-# Run services
-cd services/ingestor && python src/main.py
-cd services/aggregator && python src/main.py  
-cd services/inference && python src/main.py
+# Test hot path
+cd test/ && python unit/test_redis_hotpath.py
+
+# Run services (in separate terminals)
+cd services/ingestor && python src/sbe_mode.py      # SBE → Kinesis → Redis
+cd services/aggregator && python src/redis_writer.py # Maintain Redis state
+cd services/inference && python src/predictor.py    # Redis → predictions
+
+# Test atomic re-anchor
+cd services/ingestor && python src/rest_mode.py     # Trigger re-anchor
 ```
 
 ## Deployment
 
-### Dockerization
-Each service includes:
-- `Dockerfile` for containerization
-- Health check endpoints
-- Graceful shutdown handling
-- Resource limits
+### AWS Architecture
+- **ECS/Fargate**: Containerized services with auto-scaling
+- **Kinesis Data Streams**: SBE event streaming with Lambda processors
+- **ElastiCache Redis**: Hot state storage with cluster mode
+- **S3 Data Lake**: Bronze/silver/gold layers for training
+- **RDS Aurora**: Curated data for dashboards and audit logs
+- **Lambda Functions**: Event-driven gap detection and recovery
 
-### AWS Deployment
-- **EC2 instances** for service hosting
-- **Kinesis Data Streams** for messaging
-- **ElastiCache Redis** for feature store
-- **RDS PostgreSQL** for training data
-- **S3** for raw data storage
+### Deployment Strategy
+- **Hot Path**: ECS services with dedicated resources, no auto-scaling disruption
+- **Reliability Path**: Lambda functions triggered by EventBridge (1-min schedule)
+- **Training Pipeline**: Step Functions orchestrating S3 ETL and model training
+- **Monitoring**: CloudWatch dashboards with sub-100ms latency alerts
 
 ## Monitoring
 
-### Key Metrics
-- **Latency**: End-to-end prediction time
-- **Throughput**: Predictions per second
-- **Accuracy**: Model prediction quality
-- **Availability**: Service uptime
+### Hot Path Metrics (Critical)
+- **Inference Latency**: P50/P95/P99 <100ms for all predictions
+- **Prediction Frequency**: Exactly every 2 seconds (no missed cycles)
+- **Feature Freshness**: Redis feature age <2s (triggers degraded mode at >5s)
+- **Redis Hit Rate**: >99% for hot state reads
+- **SBE Stream Health**: Message rate, decode errors, sequence gaps
+
+### Reliability Metrics
+- **Gap Detection**: False positive/negative rates for sequence monitoring  
+- **Re-anchor Duration**: Time for atomic Redis key swapping
+- **Recovery Success Rate**: Successful gap recovery without inference disruption
+- **REST API Health**: Latency and error rates for 1-min polling
+
+### Business Metrics
+- **Prediction Accuracy**: 10-second ahead price prediction error rates
+- **Model Performance**: Directional accuracy, confidence calibration
+- **Service Availability**: 99.9% uptime excluding planned maintenance
 
 ### Health Checks
-- `/health` endpoint for each service
-- Redis connectivity
-- Database connectivity
-- Model loading status
+- `/health` endpoint: Redis connectivity, feature freshness, model status
+- `/ready` endpoint: Service ready for traffic (post-warmup)
+- `/metrics` endpoint: Prometheus-format metrics for monitoring
+- Redis cluster health: Memory usage, connection pool status
 
 ## Development Guidelines
 
-- **Simplicity first**: Focus on core functionality over complex features
-- **Real-time focused**: Optimize for low-latency prediction pipeline
-- **Modular services**: Each service has single responsibility
-- **AWS native**: Use managed AWS services where possible
-- **Monitoring**: Include health checks and metrics in all services
+- **Hot path first**: Never compromise inference latency for additional features
+- **Atomic operations**: Use Redis atomic commands for state updates during re-anchoring
+- **Graceful degradation**: Design fallbacks that maintain service availability
+- **Event-driven**: Use AWS native event services (Kinesis, EventBridge, Lambda)
+- **Monitoring driven**: Every operation must be measurable and alertable
+- **Zero-downtime**: All updates must support rolling deployments
 
 ## Important Reminders
 
-- Focus on the real-time prediction pipeline
-- Keep services lightweight and focused  
-- Prefer existing AWS services over custom solutions
-- Test locally with Docker Compose before AWS deployment
+- **Hot path isolation**: Inference service reads Redis only, never REST/S3
+- **Atomic re-anchoring**: Recovery operations use key swapping, never clearing Redis
+- **Sub-100ms requirement**: P99 inference latency is a hard constraint
+- **2-second frequency**: Predictions must be generated exactly every 2 seconds
+- **10-second target**: All predictions are for price 10 seconds ahead
+- **Test atomicity**: Validate atomic operations in local Redis before deployment

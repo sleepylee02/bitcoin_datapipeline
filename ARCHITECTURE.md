@@ -1,433 +1,343 @@
-Here’s a **single Markdown plan** (regression-only) with a clear **DB + data movement pipeline** from REST backfill → training → SBE-only live inference. It fits your repo layout and keeps the **train == infer** feature contract tight.
+# Bitcoin Pipeline Architecture
 
----
+## Overview
 
-```markdown
-# Bitcoin Data Pipeline — Regression-Only Plan (REST training, SBE inference)
+This is a **real-time Bitcoin price prediction system** that predicts price movements **10 seconds ahead** with new predictions generated **every 2 seconds**. The architecture prioritizes **sub-100ms inference latency** through a hot path design with **atomic re-anchoring** for zero-downtime reliability.
 
-**Objective:**  
-Predict **10-second ahead log-return** for `BTCUSDT` with a **lightweight MLP (regression)**.  
-- **Training (offline):** REST market data (aggTrades / trades / klines; optional depth snapshots).  
-- **Inference (live):** **SBE WebSocket only** (`trade`, `bestBidAsk`, `depth`).  
-- **Cadence:** Emit a prediction **every 1–2 seconds**.  
-- **Deadline:** end-to-end tick (features + inference) **≤ 100 ms** (soft real-time; skip late ticks).
+## Architecture Principles
 
----
+### 1. Hot Path Isolation
+The inference pipeline reads **Redis only** and never waits for REST APIs or S3 operations. This ensures consistent sub-100ms latency.
 
-## 📂 Project Structure
+### 2. Atomic Re-anchoring
+Gap recovery uses **atomic Redis key swapping** instead of clearing state, maintaining service availability during recovery operations.
+
+### 3. Tri-layer Data Storage
+- **Redis**: Hot state for real-time inference
+- **S3**: Data lake for training and historical analysis  
+- **RDS**: Curated data for dashboards and audit logs
+
+## System Architecture
 
 ```
-
-Bitcoin_datapipeline/
-├── services/
-│   ├── ingestor/            # REST backfill + SBE live publisher → Kinesis/Kafka
-│   │   ├── src/
-│   │   ├── config/
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   ├── flink-processor/     # Stream features: VWAP/TVI/volatility (writes Redis + S3 Silver)
-│   │   ├── src/
-│   │   ├── config/
-│   │   └── Dockerfile
-│   ├── inference/           # ONNX MLP regression service (pulls features from Redis)
-│   │   ├── src/
-│   │   ├── models/
-│   │   ├── config/
-│   │   └── Dockerfile
-│   └── feature-store/       # (Optional) Feast project wrapper around Redis (online) + S3 (offline)
-├── schemas/
-│   ├── avro/
-│   └── proto/
-├── infrastructure/
-│   ├── terraform/           # AWS: Kinesis Data Streams, ElastiCache Redis, S3, ECS/EKS, IAM
-│   ├── docker-compose.yml   # Local dev: LocalStack (S3/Kinesis), Redis, Flink, MinIO
-│   └── k8s/                 # Deploy manifests/Helm
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
-└── docs/
-
-````
-
----
-
-## 🧠 Modeling (Regression-Only)
-
-**Target (label):**  
-\[
-y_t = r_{t\rightarrow t+10\text{s}} = \log(\text{mid}_{t+10\text{s}}) - \log(\text{mid}_t)
-\]
-where \( \text{mid}_t = \frac{\text{bestBid}_t + \text{bestAsk}_t}{2} \).  
-If mid isn’t available in training, use a consistent **proxy** (e.g., last trade price or VWAP) and keep the same definition at inference.
-
-**Model:** Light MLP regressor  
-- Input: 20–40 engineered features (list below).  
-- Body: `in → 64 → 32 → 1` (ReLU, Dropout 0.1).  
-- Loss: **Huber** (robust to tails).  
-- Export: **ONNX** for CPU inference (fast).  
-- Metrics: **MAE**, **MSE**, and **Directional hit-rate** (sign correctness).
-
----
-
-## 🔑 Train == Infer Feature Contract
-
-### Minimal Trade-First Feature Set (Schema v1)
-_All computable from REST trades/aggTrades for training & from SBE raw trades for live. One OB field `spread` requires bestBidAsk live (SBE)._
-
-- **Returns:** `ret_1s`, `ret_2s`, `ret_5s` (log-returns using last price or VWAP)  
-- **VWAP deviation:** `vwap_5s_dev`  
-- **Activity:** `n_trades_1s`, `n_trades_5s`  
-- **Trade flow imbalance:** `buy_vol_1s`, `sell_vol_1s`, `tvi_1s`; `buy_vol_5s`, `sell_vol_5s`, `tvi_5s`  
-- **Microstructure:** `avg_trade_size_1s`, `vol_ret_10s` (std of 1s returns over 10s)  
-- **Regime flags:** `burst_1s` (n_trades_1s > rolling 60s median), `large_trade_flag_5s` (≥95th pct)  
-- **Recency:** `time_since_last_trade_ms`  
-- **Deltas:** `last_price_minus_1s`, `last_price_minus_5s`  
-- **(Optional) OB:** `spread = ask1 - bid1` _(from SBE bestBidAsk at inference; for training either approximate or exclude until OB history is recorded)_
-
-> Persist **`schema_v1.json`** (ordered list + units) and **`scaler.pkl`** from training. Use them byte-for-byte at inference.
-
----
-
-## 🏗️ Data Architecture & Movement
-
-### Storage Layers
-- **Data Lake (S3)**  
-  - **Bronze/raw:** REST backfills (JSONL/Parquet) + optional SBE raw append (if you persist live).  
-  - **Silver/curated:** Resampled 1s feature tables with exact windows & label alignment.  
-  - **Gold/serving:** Model-ready training sets + predictions archive.
-
-- **Message Bus**: **Amazon Kinesis Data Streams**  
-  - Streams: `market-sbe-trade`, `market-sbe-bestbidask`, `market-sbe-depth`, `features-1s`, `predictions-1s`.
-  - **Kinesis Data Firehose** for S3 delivery from streams.
-
-- **Online Feature Store**: **Amazon ElastiCache (Redis)**  
-  - Keys: `features:{symbol}:{ts_sec}`  
-  - TTL: 120–300s (keeps a rolling cache)  
-  - Value: JSON (or Protobuf) of schema_v1 features.
-
-- **Stream Processing**: **Amazon Kinesis Data Analytics (Apache Flink)**  
-  - Managed Flink applications for real-time feature computation.
-
-- **Model Registry**: **Amazon SageMaker Model Registry** or S3 versioning of `model.onnx` + `scaler.pkl` + `schema_v1.json`.
-
-- **Metrics/Logs**: **Amazon CloudWatch** (metrics, logs), **AWS X-Ray** (tracing), S3 (prediction archival).
-
----
-
-## 🔄 End-to-End Flow
-
-### 1) **REST Backfill → S3 (Bronze)**
-- **services/ingestor (REST mode)** pulls:
-  - `aggTrades` (+ `trades` sanity), optionally `klines` & `/depth` snapshot.
-- Writes **raw JSONL** to `s3://bitcoin-data-lake/bronze/{symbol}/aggTrades/yyyy=.../mm=.../dd=.../hh=.../*.jsonl`.
-
-**TODO**
-- [ ] Pagination by `startTime`/`endTime`, resumable by last timestamp.  
-- [ ] Exponential backoff + HTTP 429 handling.  
-- [ ] Idempotent appends; dedup by `(symbol, aggTradeId)` or `(symbol, tradeId, ts)`.
-
-### 2) **Feature Build (Training) → S3 (Silver/Gold)**
-- **features/build_train_features.py** reads Bronze trades → resamples to **1s grid**, builds **Schema v1** features, then computes **label** \(y_t\) using strict \(t \to t+10s\) timestamps.
-- Output:
-  - **Silver:** `s3://bitcoin-data-lake/silver/{symbol}/features_1s/*.parquet` (features only)  
-  - **Gold:**   `s3://bitcoin-data-lake/gold/{symbol}/train_1s/*.parquet` (features + label)
-
-**TODO**
-- [ ] O(1) rolling windows (deque/ring buffers) for speed.  
-- [ ] Use **exchange event time** (not local clock).  
-- [ ] Verify no leakage (drop last 10s tail).
-
-### 3) **Train MLP (Regression) → Model Registry**
-- **modeling/train.py**:
-  - Time-split (train/val/test by contiguous blocks).
-  - Fit **StandardScaler/RobustScaler** on train only.
-  - Train Light MLP regression (Huber loss).
-  - Save `{model.onnx, scaler.pkl, schema_v1.json}` to **SageMaker Model Registry** or S3.
-  - Record metrics in **Amazon SageMaker Experiments**.
-
-**TODO**
-- [ ] Directional hit-rate and MAE dashboards.  
-- [ ] Export test-time evaluation plots.
-
-### 4) **SBE Live Ingest → Bus → Stream Features → Redis**
-- **services/ingestor (SBE mode)**:
-  - Connect to **SBE** (`trade`, `bestBidAsk`, `depth`), **decode**, normalize to internal events.
-  - Publish to **Kinesis Data Streams**: `market-sbe-trade`, `market-sbe-bestbidask`, `market-sbe-depth`.
-  - (Optional) Also append raw SBE to S3 **Bronze** via **Kinesis Data Firehose** for replay.
-
-- **Kinesis Data Analytics (Flink)**:
-  - Consumes SBE streams, maintains rolling state, computes **Schema v1** features **each second**.
-  - Writes:
-    - **ElastiCache Redis** key `features:{symbol}:{ts_sec}` (TTL 120–300s).
-    - **S3 Silver append** (`features_1s_live/*.parquet`) via **Kinesis Data Firehose** for audit/backfill convergence.
-
-**TODO**
-- [ ] Local order book maintenance (seed `/depth` snapshot; apply SBE `depth` deltas).  
-- [ ] Handle out-of-order, duplicate, or auto-culled events.  
-- [ ] Exactly-once semantics (idempotent writes) where possible.
-
-### 5) **Inference Service (ONNX) → Predictions Stream + Archive**
-- **services/inference (ECS/EKS)**:
-  - Loads `{model.onnx, scaler.pkl, schema_v1.json}` from **SageMaker Model Registry** or S3.
-  - Tick **every 1–2s**:
-    - Pull from **ElastiCache Redis** the latest features for `{symbol, now_sec}`.  
-    - If stale: optional **fallback compute** from the last few seconds of Kinesis messages.  
-    - **Scale → ONNX predict** → \( \hat{y}_t \) (10s log-return).
-    - Emit to **Kinesis Data Streams** `predictions-1s` and archive to `s3://bitcoin-data-lake/gold/predictions_1s/*.parquet` via **Kinesis Data Firehose**.
-  - **Deadline guard:** if tick > 100 ms, **skip** and move on.
-  - **Monitoring:** CloudWatch metrics for latency, error rates, prediction distribution.
-
-**TODO**
-- [ ] Confidence/uncertainty proxy: e.g., rolling residual std from validation.  
-- [ ] Optional decisioning (thresholds) handled in a separate strategy module.
-
----
-
-## 🧾 Schemas (Avro examples)
-
-### `MarketTrade.avsc`
-```json
-{
-  "type": "record",
-  "name": "MarketTrade",
-  "namespace": "binance",
-  "fields": [
-    {"name": "symbol", "type": "string"},
-    {"name": "event_ts", "type": "long"},      // exchange event time (ms)
-    {"name": "ingest_ts", "type": "long"},     // local receive time (ms)
-    {"name": "trade_id", "type": "long"},
-    {"name": "price", "type": "double"},
-    {"name": "qty", "type": "double"},
-    {"name": "is_buyer_maker", "type": "boolean"},
-    {"name": "source", "type": "string"}       // "sbe" | "rest"
-  ]
-}
-````
-
-### `BestBidAsk.avsc`
-
-```json
-{
-  "type": "record",
-  "name": "BestBidAsk",
-  "namespace": "binance",
-  "fields": [
-    {"name": "symbol", "type": "string"},
-    {"name": "event_ts", "type": "long"},
-    {"name": "ingest_ts", "type": "long"},
-    {"name": "bid_px", "type": "double"},
-    {"name": "bid_sz", "type": "double"},
-    {"name": "ask_px", "type": "double"},
-    {"name": "ask_sz", "type": "double"},
-    {"name": "source", "type": "string"}
-  ]
-}
+┌─────────────────────────────────────────────────────────────────┐
+│                          HOT PATH (Real-time)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  SBE WebSocket ──► Kinesis ──► Lambda/KDA ──► Redis ──► Inference│
+│  (trades/depth/  │ Data     │ Processors  │ Hot    │ Service    │
+│   bestBidAsk)    │ Streams  │            │ State  │ (every 2s) │
+│                  │          │            │        │            │
+│                  │          │            │        ▼            │
+│                  │          │            │   ┌─────────────┐   │
+│                  │          │            │   │ 10s Price   │   │
+│                  │          │            │   │ Predictions │   │
+│                  │          │            │   └─────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+┌─────────────────────────────────────────────────────────────────┐
+│                     RELIABILITY PATH (Gap Recovery)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                   │                             │
+│  REST API ──► Gap Detection ──► Atomic Re-anchor ──► S3 Backfill│
+│  (1-min poll) │ (sequence     │ (key swapping)    │            │
+│               │  monitoring)  │                   │            │
+│               │               │                   │            │
+│               ▼               ▼                   ▼            │
+│         ┌──────────┐    ┌──────────┐       ┌──────────┐       │
+│         │EventBridge│    │Redis Temp│       │S3 Bronze │       │
+│         │(triggers) │    │Keys      │       │Layer     │       │
+│         └──────────┘    └──────────┘       └──────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+                                   │
+┌─────────────────────────────────────────────────────────────────┐
+│                    TRAINING PATH (Model Development)            │
+├─────────────────────────────────────────────────────────────────┤
+│                                   │                             │
+│  S3 Bronze ──► S3 Silver ──► S3 Gold ──► Model Training ──► Deploy│
+│  (raw data)  │ (normalized) │ (features/ │ (lightweight   │ to   │
+│              │              │  labels)   │  MLP)          │ ECS  │
+│              │              │            │                │      │
+│              ▼              ▼            ▼                ▼      │
+│        ┌──────────┐   ┌──────────┐ ┌──────────┐    ┌──────────┐ │
+│        │ETL       │   │Feature   │ │Training  │    │Model     │ │
+│        │Pipeline  │   │Engineering│ │Pipeline  │    │Registry  │ │
+│        └──────────┘   └──────────┘ └──────────┘    └──────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### `DepthDelta.avsc` (top-N compressed)
+## Data Flow Details
 
-```json
-{
-  "type": "record",
-  "name": "DepthDelta",
-  "namespace": "binance",
-  "fields": [
-    {"name": "symbol", "type": "string"},
-    {"name": "event_ts", "type": "long"},
-    {"name": "ingest_ts", "type": "long"},
-    {"name": "bids", "type": {"type": "array", "items": {"type":"array","items":"string"}}}, // [[px,qty],...]
-    {"name": "asks", "type": {"type": "array", "items": {"type":"array","items":"string"}}},
-    {"name": "source", "type": "string"}
-  ]
-}
+### Hot Path (SBE → Inference)
+
+#### 1. SBE Data Ingestion
+```
+SBE WebSocket Events:
+├── Trade Events        → market-sbe-trade stream
+├── Depth Updates       → market-sbe-depth stream  
+└── Best Bid/Ask        → market-sbe-bestbidask stream
 ```
 
-### `FeatureVector1s.avsc` (Schema v1)
-
-```json
-{
-  "type": "record",
-  "name": "FeatureVector1s",
-  "namespace": "features",
-  "fields": [
-    {"name":"symbol","type":"string"},
-    {"name":"ts_sec","type":"long"},
-    {"name":"ret_1s","type":"double"},
-    {"name":"ret_2s","type":"double"},
-    {"name":"ret_5s","type":"double"},
-    {"name":"vwap_5s_dev","type":"double"},
-    {"name":"n_trades_1s","type":"int"},
-    {"name":"n_trades_5s","type":"int"},
-    {"name":"buy_vol_1s","type":"double"},
-    {"name":"sell_vol_1s","type":"double"},
-    {"name":"tvi_1s","type":"double"},
-    {"name":"buy_vol_5s","type":"double"},
-    {"name":"sell_vol_5s","type":"double"},
-    {"name":"tvi_5s","type":"double"},
-    {"name":"avg_trade_size_1s","type":"double"},
-    {"name":"vol_ret_10s","type":"double"},
-    {"name":"burst_1s","type":"int"},
-    {"name":"large_trade_flag_5s","type":"int"},
-    {"name":"time_since_last_trade_ms","type":"int"},
-    {"name":"last_price_minus_1s","type":"double"},
-    {"name":"last_price_minus_5s","type":"double"},
-    {"name":"spread","type":["null","double"],"default":null}
-  ]
-}
+#### 2. Real-time Processing
+```
+Kinesis Data Streams → Lambda/KDA Functions → Redis Updates
+                                           ├── Order Book Maintenance
+                                           ├── Rolling Trade Statistics  
+                                           └── Feature Vector Updates
 ```
 
-### `Prediction1s.avsc`
-
-```json
-{
-  "type": "record",
-  "name": "Prediction1s",
-  "namespace": "predictions",
-  "fields": [
-    {"name":"symbol","type":"string"},
-    {"name":"ts_sec","type":"long"},
-    {"name":"yhat_log_return_10s","type":"double"},
-    {"name":"latency_ms","type":"double"},
-    {"name":"model_version","type":"string"}
-  ]
-}
+#### 3. Inference Pipeline
+```
+Every 2 seconds:
+Redis Read → Feature Extraction → MLP Model → 10s Price Prediction
+  (<5ms)         (<10ms)           (<30ms)         (<50ms total)
 ```
 
----
+### Reliability Path (Gap Recovery)
 
-## 🛠️ Service Responsibilities (TODO Checklists)
-
-### services/ingestor
-
-* [ ] **REST mode:** backfill aggTrades/trades/klines → S3 Bronze (resumable, dedupe).
-* [ ] **SBE mode:** connect, **decode**, normalize → publish to `market.sbe.*` streams.
-* [ ] Health endpoint + metrics (msg rate, decode errors, reconnect count).
-
-### services/flink-processor
-
-* [ ] Consume `market.sbe.*`; maintain rolling windows; compute **Schema v1** features **per second**.
-* [ ] Write **Redis** (TTL 120–300s) and append to **S3 Silver**.
-* [ ] Optional local order book module (snapshot + diffs, handle gaps/culling).
-
-### services/inference
-
-* [ ] Load `model.onnx`, `scaler.pkl`, `schema_v1.json`.
-* [ ] **Every 1–2s**: fetch features from Redis by `{symbol, ts_sec}`; if missing/stale, fallback to local compute with last N seconds from bus.
-* [ ] Scale → ONNX infer → emit to `predictions.1s` + S3 Gold.
-* [ ] Enforce **deadline**; log latency; skip tardy ticks.
-
-### feature-store (optional Feast)
-
-* [ ] Define entity `symbol` + `ts_sec`.
-* [ ] Online store Redis; offline store S3.
-* [ ] Registry in S3; materialize features to online.
-
----
-
-## ⚙️ Config Examples
-
-### `services/ingestor/config/config.yaml`
-
-```yaml
-symbols: ["BTCUSDT"]
-rest:
-  base_url: "https://data-api.binance.vision"
-sbe:
-  ws_url: "wss://stream.binance.com:9443"   # ensure SBE subprotocol if required
-aws:
-  region: "us-east-1"
-  kinesis:
-    streams:
-      trade: "market-sbe-trade"
-      bba:   "market-sbe-bestbidask"
-      depth: "market-sbe-depth"
-  s3:
-    bucket: "bitcoin-data-lake"
-    prefix: "bronze"
+#### 1. Gap Detection
+```
+EventBridge (1-min) → Lambda Gap Detector
+                   ├── Sequence ID monitoring
+                   ├── Timestamp validation
+                   └── Volume consistency checks
 ```
 
-### `services/inference/config/config.yaml`
-
-```yaml
-symbol: "BTCUSDT"
-cadence_ms: 1000
-deadline_ms: 100
-aws:
-  region: "us-east-1"
-  elasticache:
-    cluster_endpoint: "bitcoin-features.cache.amazonaws.com:6379"
-  sagemaker:
-    model_registry_name: "bitcoin-trading-model"
-  kinesis:
-    predictions_stream: "predictions-1s"
-  s3:
-    bucket: "bitcoin-data-lake"
-    prefix: "gold/predictions_1s"
-model:
-  local_cache_dir: "/tmp/models"
+#### 2. Atomic Re-anchoring Process
+```
+Gap Detected → REST API Calls → Temporary Redis Keys → Atomic Swap
+             ├── /depth snapshot       ├── ob:new:BTCUSDT      ├── RENAME commands
+             ├── /aggTrades backfill   ├── tr:new:BTCUSDT:1s   └── Cleanup temp keys
+             └── /klines validation    └── feat:new:BTCUSDT
 ```
 
----
-
-## 🧪 Testing Strategy
-
-**Unit**
-
-* Feature computations (rolling VWAP/TVI/vol).
-* Label calculation (t → t+10s).
-* MLP forward, scaler consistency.
-
-**Integration**
-
-* REST backfill → S3 Bronze; deterministic slices.
-* SBE ingest → Kinesis → Kinesis Data Analytics (Flink) → ElastiCache/S3 Silver.
-* Inference end-to-end with **LocalStack** (S3/Kinesis), **Redis**, **Flink** for local dev.
-* AWS integration tests with **Kinesis Data Streams**, **ElastiCache**, **SageMaker**.
-
-**E2E / Performance**
-
-* Replay day of data; validate that online feature vectors ≈ offline built (tolerance).
-* Latency histograms (p50/p90/p99) < deadline.
-* Backpressure handling (bus rate spikes).
-
----
-
-## 📈 Monitoring & Alerts
-
-* **Technical**: ingest throughput, decode errors, feature freshness (`now_sec - ts_sec`), inference latency p95/p99, ElastiCache hit-rate.
-* **Model**: rolling MAE, directional hit-rate, residual std; drift on feature means/std.
-* **AWS Services**: Kinesis shard utilization, ECS/EKS resource metrics, SageMaker endpoint health.
-
-**Alerts (CloudWatch)**
-
-* Feature staleness (`feature_age > 3s`) → **SNS → Slack**
-* Inference latency (`p95 > 100ms`) → **SNS → PagerDuty**
-* ElastiCache miss-rate (`> 5%`) → **SNS → Slack**
-* Kinesis consumer lag (`> threshold`) → **CloudWatch Alarm → SNS**
-
----
-
-## 🧭 MVP Order (Regression)
-
-1. **REST backfill → S3 Bronze** (aggTrades)
-2. **Offline features + labels → S3 Gold**; train MLP; export ONNX + scaler + schema
-3. **SBE ingest → bus** and **Flink features → Redis** (per-second)
-4. **Inference service** every 1–2s from Redis → predictions stream + S3 archive
-5. **Monitoring** dashboards + basic alerts
-
----
-
-## ✅ Acceptance
-
-* REST Bronze complete without gaps/dupes; Silver/Gold aligned to 1s grid.
-* `schema_v1.json` & `scaler.pkl` fixed and used identically live.
-* Inference p99 latency ≤ deadline; drop rate (missed ticks) low.
-* Shadow evaluation (no trading) shows stable MAE and directional hit-rate across regimes.
-
+#### 3. S3 Backfill
+```
+REST Data → S3 Bronze Layer → EventBridge → ETL Pipeline
 ```
 
---- 
+### Training Path (Model Development)
 
-If you want, I can turn **any box** above into code next (e.g., `features/build_train_features.py` scaffolding + `modeling/train.py` with Huber loss and ONNX export, or the **Flink window definitions** for the per-second feature stream).
+#### 1. Data Lake Pipeline
 ```
+S3 Bronze (Raw) → S3 Silver (Normalized) → S3 Gold (ML Ready)
+├── Parquet format     ├── 1-minute bars        ├── Feature vectors (2s)
+├── Partitioned by     ├── Order book snapshots ├── Labels (10s ahead)  
+│   hour/day/month     └── Trade aggregations   └── Training datasets
+```
+
+#### 2. Model Training
+```
+S3 Gold → Feature Engineering → MLP Training → Model Export
+       ├── 2-second alignment    ├── Lightweight arch  ├── ONNX format
+       ├── 10-second labels      ├── <100ms inference  └── Model registry
+       └── Time-series split     └── Hyperparameter opt
+```
+
+## Redis Hot State Schema
+
+### Key Naming Convention
+```
+ob:{symbol}           # Order book (no TTL)
+tr:{symbol}:{window}  # Trade statistics (5min TTL)
+feat:{symbol}         # Feature vector (2min TTL)
+reanchor:{symbol}     # Re-anchor flag (temp)
+```
+
+### Order Book State
+```redis
+ob:BTCUSDT (HASH):
+├── best_bid: "45229.50"
+├── best_ask: "45231.00"  
+├── spread: "1.50"
+├── bid1_p: "45229.50", bid1_q: "1.5"
+├── bid2_p: "45229.00", bid2_q: "2.1"
+├── ...
+├── ask10_p: "45240.00", ask10_q: "0.8"
+└── ts_us: "1638360000123456"
+```
+
+### Rolling Trade Statistics
+```redis
+tr:BTCUSDT:1s (HASH):      # 1-second window (5min TTL)
+├── count: "15"             # Number of trades
+├── vol: "12.5"            # Volume
+├── signed_vol: "2.3"      # Buy volume - sell volume
+├── vwap_minus_mid: "0.05" # VWAP deviation from mid
+├── interarr_mean: "0.067" # Mean time between trades
+├── interarr_var: "0.023"  # Variance of inter-arrival times
+└── last_ts_us: "1638360000123456"
+
+tr:BTCUSDT:5s (HASH):      # 5-second window (5min TTL)
+├── count: "75"
+├── vol: "65.2"
+├── signed_vol: "8.7"
+├── vwap_minus_mid: "0.12"
+└── last_ts_us: "1638360000123456"
+```
+
+### Feature Vector
+```redis
+feat:BTCUSDT (HASH):       # 2-minute TTL
+├── ret_1s: "0.0002"       # 1-second return
+├── ret_5s: "0.0015"       # 5-second return
+├── vol_imbalance: "0.03"  # Volume imbalance
+├── spread_bp: "3.3"       # Spread in basis points
+├── ob_imbalance: "0.15"   # Order book imbalance
+├── trade_intensity: "1.2" # Trades per second
+└── ts: "1638360000"       # Feature timestamp
+```
+
+## Atomic Re-anchoring Procedure
+
+### 1. Pre-conditions
+- Gap detected in SBE stream (sequence ID jump or time gap)
+- `reanchor:BTCUSDT` flag set to prevent concurrent operations
+- REST API connectivity validated
+
+### 2. Data Collection
+```python
+# Parallel REST API calls
+depth_snapshot = await binance.get_depth("BTCUSDT", limit=100)
+recent_trades = await binance.get_agg_trades("BTCUSDT", from_time=gap_start)
+klines_check = await binance.get_klines("BTCUSDT", "1m", limit=5)
+```
+
+### 3. Temporary Key Building
+```python
+# Build new state in temporary keys
+await redis.hset("ob:new:BTCUSDT", depth_snapshot)
+await redis.hset("tr:new:BTCUSDT:1s", trade_stats_1s)
+await redis.hset("tr:new:BTCUSDT:5s", trade_stats_5s)
+await redis.hset("feat:new:BTCUSDT", feature_vector)
+```
+
+### 4. Atomic Swap
+```python
+# Atomic rename operations (all succeed or all fail)
+pipeline = redis.pipeline()
+pipeline.rename("ob:new:BTCUSDT", "ob:BTCUSDT")
+pipeline.rename("tr:new:BTCUSDT:1s", "tr:BTCUSDT:1s")
+pipeline.rename("tr:new:BTCUSDT:5s", "tr:BTCUSDT:5s")
+pipeline.rename("feat:new:BTCUSDT", "feat:BTCUSDT")
+pipeline.delete("reanchor:BTCUSDT")
+pipeline.execute()  # All operations are atomic
+```
+
+### 5. Post-anchor Validation
+- Verify key existence and data integrity
+- Resume SBE stream processing
+- Log re-anchor metrics and duration
+
+## Performance Specifications
+
+### Latency Requirements
+```
+Component              Target    P99 Max
+─────────────────────────────────────────
+Redis Read            < 1ms     < 3ms
+Feature Extraction    < 5ms     < 10ms  
+MLP Inference         < 20ms    < 40ms
+Output Serialization  < 5ms     < 10ms
+─────────────────────────────────────────
+Total Inference       < 30ms    < 100ms
+```
+
+### Throughput Requirements
+```
+Metric                 Target        Peak
+─────────────────────────────────────────
+Predictions/sec        0.5 (every 2s) 1.0
+SBE Events/sec         1,000         5,000
+Redis Ops/sec          10,000        50,000
+Kinesis Records/sec    5,000         25,000
+```
+
+### Availability Requirements
+```
+Service               Uptime    Recovery Time
+──────────────────────────────────────────
+Inference Service     99.9%     < 30s
+Redis Cluster         99.95%    < 10s (failover)
+Kinesis Streams       99.99%    N/A (managed)
+Re-anchor Process     N/A       < 60s
+```
+
+## Failure Scenarios and Recovery
+
+### 1. SBE Stream Disconnection
+```
+Detection: No events for >5 seconds
+Response: 
+├── Continue inference from Redis (stale data grace period)
+├── Attempt SBE reconnection
+└── If failed: Trigger REST re-anchor
+```
+
+### 2. Redis Cluster Failure
+```
+Detection: Connection timeout or cluster split
+Response:
+├── Failover to Redis replica (automatic)
+├── If total failure: Degrade to direct REST API mode
+└── Alert ops team for manual intervention
+```
+
+### 3. Gap Detection False Positives
+```
+Prevention:
+├── Multiple validation criteria (sequence + time + volume)
+├── Configurable thresholds per environment
+└── Manual override capability
+```
+
+### 4. Model Loading Failure
+```
+Detection: Model inference timeout or error
+Response:
+├── Reload model from S3/model registry
+├── If failed: Use last-known-good model
+└── If none available: Return confidence=0 predictions
+```
+
+## Monitoring and Alerting
+
+### Critical Alerts (PagerDuty)
+- Inference latency P99 > 100ms for >2 minutes
+- Prediction frequency deviation >10% for >5 minutes  
+- Redis cluster failure or split-brain
+- SBE stream disconnected >60 seconds
+
+### Warning Alerts (Slack)
+- Feature freshness >5 seconds
+- Gap detection triggered
+- Re-anchor operation duration >60 seconds
+- Model accuracy degradation >20%
+
+### Dashboard Metrics
+- Real-time inference latency histogram
+- Prediction accuracy rolling 1-hour window
+- Redis hit rate and memory usage
+- SBE stream health and gap frequency
+- Re-anchor success rate and duration
+
+## Security Considerations
+
+### Network Security
+- VPC with private subnets for Redis and inference
+- Security groups restricting access to necessary ports
+- NAT Gateway for outbound Binance API calls
+
+### Data Security  
+- Encryption in transit (TLS) for all communications
+- Encryption at rest for S3 and RDS
+- No sensitive data in Redis (market data only)
+- API keys stored in AWS Secrets Manager
+
+### Access Control
+- IAM roles with minimal permissions
+- Service-to-service authentication via IAM roles
+- No hardcoded credentials in code or configuration
+- CloudTrail logging for all AWS API calls
+
+This architecture provides a robust foundation for real-time Bitcoin price prediction with sub-100ms latency and zero-downtime reliability through atomic re-anchoring.
