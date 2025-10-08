@@ -1,0 +1,50 @@
+# Local test configuration for REST ingestor
+# No Docker dependencies - minimal setup for unit testing
+
+binance:
+  rest_base_url: "https://data-api.binance.vision"
+  symbols: ["BTCUSDT"]
+  rate_limit_requests_per_minute: 600  # Conservative for testing
+  request_timeout_seconds: 30
+
+# Use local filesystem instead of S3
+aws:
+  region: "us-east-1"
+  s3_bucket: "test-bucket"
+  s3_bronze_prefix: "bronze"
+  s3_checkpoint_prefix: "checkpoints"
+  # Local storage for testing
+  use_local_storage: true
+  local_storage_path: "./test/data/output"
+
+scheduler:
+  enabled: true
+  collection_interval: "2m"  # Short interval for testing
+  data_types: ["aggTrades"]  # Only test aggTrades
+  overlap_minutes: 1
+
+checkpoint:
+  storage_type: "local"
+  local_directory: "./test/data/checkpoints"
+
+retry:
+  max_attempts: 3
+  initial_backoff_seconds: 1.0
+  max_backoff_seconds: 10.0
+  backoff_multiplier: 2.0
+  jitter: true
+
+logging:
+  level: "DEBUG"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]
+  file_path: "./test/data/logs/rest-ingestor.log"
+
+health:
+  enabled: true
+  port: 8080
+  host: "127.0.0.1"
+
+metrics:
+  enable_prometheus: false  # Disable for testing
+  enable_cloudwatch: false

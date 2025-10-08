@@ -1,0 +1,129 @@
+# Docker Compose for local testing of ingestor services
+# This sets up minimal infrastructure for testing
+
+version: '3.8'
+
+services:
+  # LocalStack for AWS services simulation
+  localstack:
+    image: localstack/localstack:3.0
+    ports:
+      - "4566:4566"
+      - "4510-4559:4510-4559"
+    environment:
+      - SERVICES=s3,kinesis
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - HOSTNAME_EXTERNAL=localstack
+    volumes:
+      - "./tmp/localstack:/tmp/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for feature storage (used by aggregator later)
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL for training data (used by data-connector later)
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=bitcoin_pipeline
+      - POSTGRES_USER=pipeline_user
+      - POSTGRES_PASSWORD=pipeline_pass
+    volumes:
+      - "./tmp/postgres:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline_user -d bitcoin_pipeline"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # REST Ingestor Service
+  rest-ingestor:
+    build:
+      context: ./services/rest-ingestor
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - CONFIG_FILE=config/local.yaml
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - "./test-data:/app/test-data"
+      - "./test-checkpoints:/app/test-checkpoints"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # SBE Ingestor Service
+  sbe-ingestor:
+    build:
+      context: ./services/sbe-ingestor
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - CONFIG_FILE=config/local.yaml
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-dummy_key}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET:-dummy_secret}
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Aggregator Service (for complete pipeline testing)
+  aggregator:
+    build:
+      context: ./services/aggregator
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      - CONFIG_FILE=config/local.yaml
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    depends_on:
+      localstack:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  localstack_data:
+  postgres_data:
+
+networks:
+  default:
+    name: bitcoin_pipeline_test
