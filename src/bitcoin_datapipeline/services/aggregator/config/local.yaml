@@ -1,0 +1,39 @@
+# Local development configuration for aggregator
+# Uses LocalStack Kinesis and local Redis
+
+aws:
+  region: "us-east-1"
+  endpoint_url: "http://localhost:4566"  # LocalStack
+
+kinesis:
+  streams:
+    trade: "market-trade-stream"
+    bestbidask: "market-bestbidask-stream"
+    depth: "market-depth-stream"
+  polling_interval_seconds: 1.0
+  max_records_per_request: 100
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: null
+  db: 0
+  key_prefix: "features"
+  ttl_seconds: 60  # 1 minute TTL for development
+  socket_timeout: 5
+  socket_connect_timeout: 5
+
+aggregation:
+  min_messages: 10   # Aggregate after 10 messages
+  max_interval_seconds: 5  # Or after 5 seconds
+  check_interval_seconds: 1.0
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console", "file"]
+
+health:
+  enabled: true
+  port: 8083
+  host: "0.0.0.0"

@@ -1,0 +1,51 @@
+# Local test configuration for SBE ingestor
+# No Docker dependencies - minimal setup for unit testing
+
+binance:
+  sbe_ws_url: "wss://stream-sbe.binance.com:9443"
+  api_key: "${BINANCE_API_KEY:test_key}"
+  api_secret: "${BINANCE_API_SECRET:test_secret}"
+  symbols: ["BTCUSDT"]
+  stream_types: ["trade"]  # Only test trade stream for simplicity
+  reconnect_interval_seconds: 5
+  heartbeat_interval_seconds: 30
+
+# Mock AWS configuration for testing
+aws:
+  region: "us-east-1"
+  endpoint_url: "http://localhost:4566"  # LocalStack
+  use_local_storage: true
+
+# Mock Kinesis configuration
+kinesis:
+  streams:
+    trade: "test-trade-stream"
+    bestbidask: "test-bestbidask-stream"
+    depth: "test-depth-stream"
+  batch_size: 10  # Small batches for testing
+  flush_interval_seconds: 1
+  max_retries: 3
+  # Local file output for testing
+  local_output_dir: "./test/data/output"
+
+retry:
+  max_attempts: 3
+  initial_backoff_seconds: 1.0
+  max_backoff_seconds: 10.0
+  backoff_multiplier: 2.0
+  jitter: true
+
+logging:
+  level: "DEBUG"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]
+  file_path: "./test/data/logs/sbe-ingestor.log"
+
+health:
+  enabled: true
+  port: 8081
+  host: "127.0.0.1"
+
+metrics:
+  enable_prometheus: false  # Disable for testing
+  enable_cloudwatch: false

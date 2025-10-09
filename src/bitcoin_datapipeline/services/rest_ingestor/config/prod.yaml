@@ -1,0 +1,42 @@
+# Production configuration for REST ingestor
+# Uses AWS services
+
+binance:
+  rest_base_url: "https://data-api.binance.vision"
+  symbols: ["BTCUSDT", "ETHUSDT"]
+  rate_limit_requests_per_minute: 1200
+  request_timeout_seconds: 30
+
+aws:
+  region: "${AWS_REGION:us-east-1}"
+  s3_bucket: "${S3_BUCKET:bitcoin-data-lake-prod}"
+  s3_bronze_prefix: "bronze"
+  s3_checkpoint_prefix: "checkpoints"
+  # endpoint_url not set for production (uses default AWS endpoints)
+
+scheduler:
+  enabled: true
+  collection_interval: "${COLLECTION_INTERVAL:6h}"  # Collect every 6 hours
+  data_types: ["aggTrades", "klines"]
+  overlap_minutes: 10  # 10-minute overlap for production
+
+checkpoint:
+  storage_type: "s3"  # Use S3 for production checkpoints
+  local_directory: "/tmp/checkpoints"  # Fallback
+
+retry:
+  max_attempts: 5
+  initial_backoff_seconds: 2.0
+  max_backoff_seconds: 300.0
+  backoff_multiplier: 2.5
+  jitter: true
+
+logging:
+  level: "${LOG_LEVEL:INFO}"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]  # CloudWatch handles file logging
+
+health:
+  enabled: true
+  port: 8080
+  host: "0.0.0.0"

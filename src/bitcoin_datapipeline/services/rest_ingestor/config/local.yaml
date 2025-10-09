@@ -1,0 +1,42 @@
+# Local development configuration for REST ingestor
+# Uses LocalStack for S3 simulation
+
+binance:
+  rest_base_url: "https://data-api.binance.vision"
+  symbols: ["BTCUSDT"]
+  rate_limit_requests_per_minute: 1200
+  request_timeout_seconds: 30
+
+aws:
+  region: "us-east-1"
+  s3_bucket: "bitcoin-data-lake"
+  s3_bronze_prefix: "bronze"
+  s3_checkpoint_prefix: "checkpoints"
+  endpoint_url: "http://localhost:4566"  # LocalStack
+
+scheduler:
+  enabled: true
+  collection_interval: "1h"  # Collect every hour
+  data_types: ["aggTrades", "klines"]
+  overlap_minutes: 5  # 5-minute overlap to prevent gaps
+
+checkpoint:
+  storage_type: "local"  # Use local files for development
+  local_directory: "./checkpoints"
+
+retry:
+  max_attempts: 3
+  initial_backoff_seconds: 1.0
+  max_backoff_seconds: 60.0
+  backoff_multiplier: 2.0
+  jitter: true
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console", "file"]
+
+health:
+  enabled: true
+  port: 8080
+  host: "0.0.0.0"

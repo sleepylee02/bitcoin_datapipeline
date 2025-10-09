@@ -1,0 +1,41 @@
+# Production configuration for SBE ingestor
+# Uses AWS Kinesis Data Streams
+
+binance:
+  sbe_base_url: "wss://stream-sbe.binance.com:9443"
+  api_key: "${BINANCE_API_KEY}"
+  api_secret: "${BINANCE_API_SECRET}"
+  symbols: ["BTCUSDT", "ETHUSDT"]
+  stream_types: ["trade", "bestBidAsk", "depth"]
+  reconnect_interval_seconds: 10
+  heartbeat_interval_seconds: 30
+
+aws:
+  region: "${AWS_REGION:us-east-1}"
+  # endpoint_url not set for production
+
+kinesis:
+  streams:
+    trade: "${KINESIS_TRADE_STREAM:bitcoin-market-trade-stream}"
+    bestbidask: "${KINESIS_BESTBIDASK_STREAM:bitcoin-market-bestbidask-stream}"
+    depth: "${KINESIS_DEPTH_STREAM:bitcoin-market-depth-stream}"
+  batch_size: 500
+  flush_interval_seconds: 2
+  max_retries: 5
+
+retry:
+  max_attempts: 10
+  initial_backoff_seconds: 2.0
+  max_backoff_seconds: 300.0
+  backoff_multiplier: 2.5
+  jitter: true
+
+logging:
+  level: "${LOG_LEVEL:INFO}"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]  # CloudWatch handles file logging
+
+health:
+  enabled: true
+  port: 8081
+  host: "0.0.0.0"

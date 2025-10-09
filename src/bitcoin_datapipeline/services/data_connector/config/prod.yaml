@@ -1,0 +1,33 @@
+# Production configuration for data connector
+# Uses AWS RDS PostgreSQL
+
+aws:
+  region: "${AWS_REGION:us-east-1}"
+  s3_bucket: "${S3_BUCKET:bitcoin-data-lake-prod}"
+  s3_bronze_prefix: "bronze"
+  # endpoint_url not set for production
+
+database:
+  host: "${DATABASE_HOST}"
+  port: ${DATABASE_PORT:5432}
+  user: "${DATABASE_USER}"
+  password: "${DATABASE_PASSWORD}"
+  name: "${DATABASE_NAME:bitcoin_data}"
+  pool_min_size: 5
+  pool_max_size: 20
+
+etl:
+  cycle_interval_seconds: ${ETL_CYCLE_INTERVAL:1800}  # 30 minutes
+  batch_size: ${ETL_BATCH_SIZE:500}
+  enable_derived_features: true
+  max_file_age_hours: ${MAX_FILE_AGE_HOURS:168}  # 7 days
+
+logging:
+  level: "${LOG_LEVEL:INFO}"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers: ["console"]  # CloudWatch handles file logging
+
+health:
+  enabled: true
+  port: 8082
+  host: "0.0.0.0"
