@@ -39,7 +39,7 @@ pip install -r requirements-dev.txt
 
 # Install dependencies from each service (using new paths)
 echo "📦 Installing service dependencies..."
-services=("rest-ingestor" "sbe-ingestor" "aggregator" "data-connector")
+services=("rest_ingestor" "sbe_ingestor" "aggregator" "data_connector")
 for service in "${services[@]}"; do
     service_path="src/bitcoin_datapipeline/services/$service"
     if [ -d "$service_path" ] && [ -f "$service_path/requirements.txt" ]; then
@@ -50,15 +50,15 @@ for service in "${services[@]}"; do
     fi
 done
 
-# Build SBE decoder (using new path)
+# Build SBE decoder (using test build for development)
 echo "🔧 Building SBE decoder..."
-cd "$PROJECT_ROOT/src/bitcoin_datapipeline/services/sbe-ingestor"
-if [ -f "build_sbe_decoder.sh" ]; then
-    chmod +x build_sbe_decoder.sh
-    ./build_sbe_decoder.sh
-    echo "✅ SBE decoder built successfully"
+cd "$PROJECT_ROOT/src/bitcoin_datapipeline/services/sbe_ingestor"
+if [ -f "build_sbe_decoder_test.sh" ]; then
+    chmod +x build_sbe_decoder_test.sh
+    ./build_sbe_decoder_test.sh
+    echo "✅ SBE decoder built successfully (test mode)"
 else
-    echo "❌ SBE decoder build script not found"
+    echo "❌ SBE decoder test build script not found"
     exit 1
 fi
 

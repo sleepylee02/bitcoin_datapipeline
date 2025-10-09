@@ -3,18 +3,13 @@
 
 set -e
 
-# Context-aware path resolution
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TESTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
+TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$TEST_DIR/.." && pwd)"
 
 echo "🧪 Bitcoin Pipeline - Test Runner"
 echo "================================"
-echo "📍 Script location: $SCRIPT_DIR"
-echo "📍 Tests directory: $TESTS_DIR"
-echo "📍 Project root: $PROJECT_ROOT"
 
-cd "$TESTS_DIR"
+cd "$TEST_DIR"
 
 # Load environment
 if [ -f ".env" ]; then
@@ -24,18 +19,19 @@ if [ -f ".env" ]; then
 fi
 
 # Activate virtual environment
-if [ -f "$PROJECT_ROOT/venv/bin/activate" ]; then
-    source "$PROJECT_ROOT/venv/bin/activate"
+if [ -f "$PROJECT_ROOT/.venv/bin/activate" ]; then
+    source "$PROJECT_ROOT/.venv/bin/activate"
 else
     echo "⚠️  Virtual environment not found. Run setup-test-env.sh first."
     exit 1
 fi
 
-# Add src to Python path for new structure
-export PYTHONPATH="$PROJECT_ROOT/src:$PYTHONPATH"
+# Add project to Python path
+export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
-# Alternative: Run all tests with pytest discovery
-echo "💡 Alternative: Run 'pytest' from project root for automatic test discovery"
+echo "📍 Test directory: $TEST_DIR"
+echo "📍 Project root: $PROJECT_ROOT"
+echo "📍 Python path: $PYTHONPATH"
 
 # Run unit tests
 echo ""
@@ -43,11 +39,11 @@ echo "1️⃣ Running Unit Tests..."
 echo "========================"
 
 echo "🔧 Testing REST client..."
-pytest unit/test_rest_client.py -v
+python unit/test_rest_client.py
 echo ""
 
 echo "🔧 Testing SBE client..."
-pytest unit/test_sbe_client.py -v
+python unit/test_sbe_client.py
 echo ""
 
 # Run integration tests
@@ -55,7 +51,7 @@ echo "2️⃣ Running Integration Tests..."
 echo "==============================="
 
 echo "🔧 Testing full services..."
-pytest integration/test_full_services.py -v
+python integration/test_full_services.py
 echo ""
 
 # Run e2e tests if Docker is available
@@ -74,7 +70,7 @@ if command -v docker-compose >/dev/null 2>&1; then
     
     if [ -f "e2e/test_pipeline.py" ]; then
         echo "🔧 Testing full pipeline..."
-        pytest e2e/test_pipeline.py -v
+        python e2e/test_pipeline.py
     else
         echo "⚠️  E2E test not found, skipping..."
     fi

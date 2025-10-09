@@ -27,7 +27,7 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    # Core dependencies will be installed from individual service requirements
+    # Core dependencies are installed from individual service requirements.txt files
 ]
 
 [project.optional-dependencies]
@@ -61,7 +61,7 @@ include = ["bitcoin_datapipeline*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
-python_classes = ["Test*", "*Tests"]  
+python_classes = ["Test*", "*Tests"]
 python_functions = ["test_*", "check_*"]
 addopts = [
     "-v",
@@ -81,7 +81,7 @@ markers = [
 ]
 norecursedirs = [
     ".git",
-    ".tox", 
+    ".tox",
     "dist",
     "build",
     "*.egg",

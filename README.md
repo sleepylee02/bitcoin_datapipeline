@@ -63,7 +63,7 @@ bitcoin-datapipeline/
 │   │   ├── inference/          # Price prediction service
 │   │   └── trainer/            # Model training pipeline
 │   ├── schemas/                # Data schemas (Avro)
-│   └── common/                 # Shared utilities
+│   └── schemas/                # Data schemas (Avro)
 ├── tests/                      # Test suite
 ├── docs/                       # Documentation
 ├── deployment/                 # Infrastructure as code
@@ -101,6 +101,61 @@ pytest tests/integration/ -v
 
 # Run with Docker (E2E tests)
 cd tests && docker-compose -f docker-compose.test.yml up -d
+```
+
+### Development Scripts
+The `scripts/` directory contains automation scripts for development workflow:
+
+#### `scripts/setup-dev.sh`
+**Complete development environment setup** - handles all dependencies and builds.
+
+```bash
+# From project root
+./scripts/setup-dev.sh
+```
+
+**What it does:**
+- ✅ Checks for virtual environment
+- ✅ Upgrades pip and installs dev dependencies  
+- ✅ Installs all service dependencies from `requirements.txt` files
+- ✅ Builds SBE decoder (C++ extension)
+- ✅ Installs project in development mode (`pip install -e .`)
+- ✅ Verifies imports and shows next steps
+
+**Requirements:**
+- Virtual environment activated
+- `pyproject.toml` and `requirements-dev.txt` present
+- SBE decoder build dependencies
+
+#### `scripts/setup-localstack.sh`
+**LocalStack AWS resource setup** - creates AWS resources for E2E testing.
+
+```bash
+# Start LocalStack first
+docker run -d -p 4566:4566 localstack/localstack
+
+# Setup AWS resources
+./scripts/setup-localstack.sh
+```
+
+**What it does:**
+- ✅ Waits for LocalStack to be ready (60s timeout)
+- ✅ Creates Kinesis streams for market data
+- ✅ Creates S3 buckets for data storage
+- ✅ Lists created resources for verification
+
+**Requirements:**
+- LocalStack running on port 4566
+- AWS CLI installed
+- Docker for LocalStack container
+
+**Troubleshooting:**
+```bash
+# Check LocalStack health
+curl http://localhost:4566/health
+
+# Manual resource creation
+aws --endpoint-url=http://localhost:4566 kinesis list-streams --region us-east-1
 ```
 
 ### Service Development

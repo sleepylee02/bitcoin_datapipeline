@@ -231,15 +231,15 @@ class BinanceRESTClient:
                 
                 # Process each trade
                 for trade in trades:
-                    # Normalize trade data
+                    # Normalize trade data (REST API format)
                     normalized_trade = {
-                        'symbol': trade['s'],
-                        'event_ts': trade['T'],
+                        'symbol': symbol,  # Symbol is passed as parameter, not in response
+                        'event_ts': trade['T'],  # Timestamp
                         'ingest_ts': int(time.time() * 1000),
                         'trade_id': trade['a'],  # aggTradeId
-                        'price': float(trade['p']),
-                        'qty': float(trade['q']),
-                        'is_buyer_maker': trade['m'],
+                        'price': float(trade['p']),  # Price
+                        'qty': float(trade['q']),   # Quantity
+                        'is_buyer_maker': trade['m'],  # isBuyerMaker
                         'source': 'rest'
                     }
                     
